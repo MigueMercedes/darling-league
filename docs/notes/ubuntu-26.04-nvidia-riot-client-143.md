@@ -12,6 +12,11 @@ binary is modified and no debugger is attached to client or game processes.
 Status: **fixed** (in the fork, verified live), **pending** (understood, not
 fixed yet), **observed** (seen, not investigated yet).
 
+Workflow (ongoing, not a one-off): every new problem found while playing
+(Normals/ARAM) gets an entry here first; it is fixed in the compatibility layer
+with a regression test, verified live, and then shipped upstream as its own
+focused PR. Fixed entries stay listed with the PR link once opened.
+
 | # | Area | Problem | Status | Planned PR |
 |---|------|---------|--------|------------|
 | 1 | launcher | Xwayland auth cookie not found on GNOME/Mutter | fixed | A |
