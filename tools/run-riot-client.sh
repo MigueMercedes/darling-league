@@ -118,6 +118,24 @@ fi
 # The bundled downloader rejects IPv6 CONNECT_TO addresses. Only Riot CDN
 # AAAA lookups are suppressed; set this to 0 to retain the upstream resolver.
 export RCLOL_CDN_IPV4_ONLY="${RCLOL_CDN_IPV4_ONLY:-1}"
+# On GNOME/Mutter Wayland, Xwayland writes its auth cookie under XDG_RUNTIME_DIR
+# (.mutter-Xwaylandauth.*). Auto-discover it before any helper can start Darling
+# so launchd and iokitd inherit XAUTHORITY (and ~/.Xauthority fallback).
+if [ -n "${DISPLAY:-}" ] && { [ -z "${XAUTHORITY:-}" ] || [ ! -r "${XAUTHORITY:-}" ]; }; then
+ xauth_dir=${XDG_RUNTIME_DIR:-}
+ if [ -n "$xauth_dir" ] && [ -d "$xauth_dir" ]; then
+  for candidate in "$xauth_dir"/.mutter-Xwaylandauth.* "$xauth_dir"/xauth_*; do
+   if [ -f "$candidate" ] && [ -r "$candidate" ]; then
+    XAUTHORITY=$candidate
+    export XAUTHORITY
+    if [ -n "${HOME:-}" ] && [ ! -r "$HOME/.Xauthority" ]; then
+     cp -f "$candidate" "$HOME/.Xauthority" 2>/dev/null && chmod 600 "$HOME/.Xauthority" 2>/dev/null || true
+    fi
+    break
+   fi
+  done
+ fi
+fi
 # Capture ownership before the certificate helper can start this session's runtime.
 runtime_at_start=$(python3 "$runner_dir/session-supervisor.py" --prefix "$prefix_dir" --probe-runtime)
 python3 "$runner_dir/ensure-darling-runtime.py"
@@ -220,20 +238,6 @@ else
  fi
 fi
 # --- darling-lol perf: scheduling & driver latency hints ---
-# On GNOME/Mutter Wayland, Xwayland writes its auth cookie under XDG_RUNTIME_DIR
-# (.mutter-Xwaylandauth.*). Auto-discover it when XAUTHORITY is unset or unreadable.
-if [ -n "${DISPLAY:-}" ] && { [ -z "${XAUTHORITY:-}" ] || [ ! -r "${XAUTHORITY:-}" ]; }; then
- xauth_dir=${XDG_RUNTIME_DIR:-}
- if [ -n "$xauth_dir" ] && [ -d "$xauth_dir" ]; then
-  for candidate in "$xauth_dir"/.mutter-Xwaylandauth.* "$xauth_dir"/xauth_*; do
-   if [ -f "$candidate" ] && [ -r "$candidate" ]; then
-    XAUTHORITY=$candidate
-    export XAUTHORITY
-    break
-   fi
-  done
- fi
-fi
 # When NVIDIA is the only active DRM GPU and Mesa's software ICD (lvp_icd) is
 # installed alongside nvidia_icd.json, pin the NVIDIA Vulkan ICD so the loader
 # cannot enumerate llvmpipe ahead of the presenting GPU (issue #127).
