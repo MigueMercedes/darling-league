@@ -85,7 +85,7 @@
         "QuartzCore/CAEDRMetadata.m",
         "QuartzCore/include/QuartzCore/CAEDRMetadata.h"
       ],
-      "patch_sha256": "b239a3033eb497c2f997f2a79d59c005975a158df2ca0490230b81e9bc5f2d08"
+      "patch_sha256": "7edceab692f406c3b7c676f01078bf6f9055bca91585653544c5d0a0b77bf1b0"
     },
     {
       "path": "src/external/compiler-rt",
