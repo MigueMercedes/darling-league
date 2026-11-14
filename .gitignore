@@ -3,6 +3,7 @@
 /Config/
 /Library/
 /backups*/
+personal/
 .env
 .env.*
 !/.env.example
