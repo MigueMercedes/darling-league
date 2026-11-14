@@ -150,6 +150,52 @@ Darling.
 - `launchctl load .../com.riot.riotclient.checkinstalls.plist` fails; the
   client reports `launch_agent_failure` but patching continues.
 
+## 14. Shader and pipeline compilation stutter (observed in live matches)
+
+- **Symptom:** Framerate dips from ~130 FPS down to 30–50 FPS when champions,
+  abilities, particles, or new map sectors are encountered for the first time.
+  Once all spells have been cast, performance stabilizes at ~133 FPS.
+- **Root cause:** In `indium/render-pipeline.cpp` and `compute-pipeline.cpp`,
+  `vkCreateGraphicsPipelines` passes `VK_NULL_HANDLE` as the `VkPipelineCache`.
+  Every new shader permutation triggers synchronous Apple IR (AIR) -> SPIR-V
+  lowering (`iridium/air.cpp`) and driver GPU compilation on the main thread.
+- **Data from live log (`2026-11-13T20-08-19_r3dlog.txt`):**
+  - Average FPS: 133.11 fps (Average Frame Time: 7.51 ms).
+  - Normal gameplay reaches 120–140 FPS on NVIDIA RTX 3060 Ti once cached.
+- **Future fix:** Implement persistent disk-backed `VkPipelineCache` in Indium
+  (e.g., in `~/Library/Caches/Indium/vkPipelineCache.bin`).
+
+## 15. In-game graphics quality change freezes the game for ~28 seconds (observed)
+
+- **Symptom:** Changing graphics quality settings (e.g., textures, shadows,
+  effects) causes a complete game freeze lasting ~28 seconds.
+- **Log trace:**
+  `000689.524| ALWAYS| PRFW| Detected very long frame: 28.170s`
+- **Root cause:** Changing quality settings in League calls
+  `r3dRenderLayer::RecreateOwnedResources`, wiping all pipeline state objects.
+  Every shader is synchronously re-translated and compiled sequentially on the
+  main render thread, resulting in a single 28.17-second frozen frame.
+
+## 16. Match exit / game window hang for 10–11 seconds (observed)
+
+- **Symptom:** When a match finishes and the player confirms exit, the game
+  window freezes in place for 10 to 11 seconds before finally closing and
+  returning to the post-game lobby.
+- **Log trace (`r3dlog.txt`):**
+  - `000975.987| ALWAYS| CONN| Requesting disconnect (19)`
+  - `000976.032| ALWAYS| FLOW| Finished Main Loop`
+  - `000987.305| ALWAYS| FLOW| LCU Game End Status: GAMEFLOW_EVENT.GAME_COMPLETED Result: 200: SUCCESS` (11.273s delta)
+  - `000988.261| ALWAYS| FLOW| Destroying the renderer`
+- **Root cause:** The main game loop stops pumping events at
+  `Finished Main Loop`, leaving the X11/Wayland window frozen. Meanwhile,
+  the reliable UDP network layer waits up to its 8-second disconnect timeout
+  (`Timeout=8` in `netstats`) for a server disconnect ACK before notifying LCU
+  via `POST /lol-gameflow/v1/session/event`. Only after LCU acknowledges does
+  the client destroy the renderer and close the window.
+- **Investigation:** Investigate hiding or unmapping the X11 window immediately
+  when `Finished Main Loop` / `GAMESTATE_EXIT` is entered so the user does not
+  see a frozen screen during the disconnect handshake.
+
 ---
 
 ## Pull request plan
@@ -163,3 +209,4 @@ passing. Each PR branches from `upstream/main`:
 - **C** `fix/foundation-constant-number-unsigned`: entry 6.
 - **D** `fix/indium-air-unpack`: entry 7.
 - **E** `fix/x11-scroll-wheel`: entry 8 (and 9 if related), once fixed.
+- **F** `opt/indium-pipeline-cache`: entry 14 & 15 (persistent Vulkan pipeline cache).
