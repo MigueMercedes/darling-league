@@ -113,24 +113,48 @@ focused PR. Fixed entries stay listed with the PR link once opened.
   to GLSL.std.450 `Unpack*`, applying the sRGB-to-linear curve to RGB.
 - **Files:** `patches/metal--deps--indium.patch` (`src/iridium/air.cpp`).
 
-## 8. Mouse wheel does not scroll the Electron 43 UI (pending)
+## 8. Mouse wheel does not scroll the Electron 43 UI (resolved)
 
-- **Symptom:** the wheel does nothing in the Riot Client UI. This blocks the
+- **Symptom:** the wheel does nothing in the Riot Client UI. This blocked the
   first-login Terms of Service dialog, which only enables "Accept" after the
   text is scrolled to the end; keyboard scrolling did not work either.
-- **Known so far:** X11 buttons 4–7 become `NSScrollWheel` events in
-  `X11Display.m` and are routed by `-[NSWindow sendEvent:]` to the hit-tested
-  view. Electron's `WebMouseWheelEventBuilder` reads `scrollingDeltaX/Y`,
-  `hasPreciseScrollingDeltas`, `phase`/`momentumPhase` and fields of
-  `[event CGEvent]` through `CGEventGetIntegerValueField`.
-- **Next:** trace which values Chromium reads and why the event is dropped,
-  fix in cocotron (AppKit/CoreGraphics), add a regression test.
+- **Root causes:**
+  1. `-[NSEvent initWithType:...]` initialized `_timestamp` from
+     `[NSDate timeIntervalSinceReferenceDate]` (~8.16e8s since 2001-01-01)
+     instead of monotonic system uptime (`mach_absolute_time()`), and
+     `-[NSEvent_mouse initWithType:...]` overwrote any explicit `timestamp`
+     passed from `X11Display.m`. Chromium's `ui::EventTimeStampFromSeconds`
+     compares `[event timestamp]` against `base::TimeTicks::Now()` (monotonic
+     uptime) and drops or mis-schedules input events whose timestamps are
+     25.8 years in the future.
+  2. `CGEventCreateScrollWheelEvent` in `CoreGraphics/CGEvent.m` stored
+     `kCGScrollWheelEventFixedPtDeltaAxis1..3` as `[NSNumber numberWithDouble:val]`
+     instead of 16.16 fixed-point integers (`(int64_t)(val * 0x00010000)`),
+     so `CGEventGetDoubleValueField(cgEvent, kCGScrollWheelEventFixedPtDeltaAxis1)`
+     divided the integer value by `65536.0` and returned `0.000015` instead of
+     `1.0`.
+  3. `-[NSEvent_mouse initWithType:...windowNumber:...]` messaged
+     `[(id)windowNumber delegate]`, treating an integer window number as an
+     Objective-C pointer when `windowNumber` was non-zero.
+- **Fix:**
+  - Use `darlingSystemUptime()` (`mach_absolute_time()` scaled via
+    `mach_timebase_info`) in `AppKit/NSEvent.subproj/NSEvent.m` and preserve
+    explicit timestamps in `AppKit/NSEvent.subproj/NSEvent_mouse.m`.
+  - Store `kCGScrollWheelEventFixedPtDeltaAxis1..3` as 16.16 fixed-point
+    integers in `CoreGraphics/CGEvent.m` and populate `kCGScrollWheelEventIsContinuous`,
+    event location, and modifier flags on `[NSEvent_mouse CGEvent]`.
+- **Files:** `patches/cocotron.patch` (`AppKit/NSEvent.subproj/NSEvent.m`,
+  `AppKit/NSEvent.subproj/NSEvent_mouse.m`, `CoreGraphics/CGEvent.m`),
+  `tools/riot-scroll-event-check.m`.
+- **Verified:** `build/riot-scroll-event-check` (`SCROLL_EVENT vertical=pass horizontal=pass phases=none cg_notches=pass`).
 
-## 9. UI does not repaint after some state changes (observed)
+## 9. UI does not repaint after some state changes (resolved with #8)
 
-After a state change made outside the visible page (agreement already accepted)
-the window kept showing the old dialog. Possibly related to #8 (input/paint
-pumping). Needs investigation.
+- **Root cause:** Same `[NSEvent timestamp]` epoch mismatch (`CFAbsoluteTime`
+  since 2001 vs. `mach_absolute_time()` monotonic uptime) that corrupted
+  Chromium's input/compositor frame scheduling in Electron 43.
+- **Fix:** Resolved by the monotonic `darlingSystemUptime()` fix in
+  `AppKit/NSEvent.subproj/NSEvent.m`.
 
 ## 10. Changing the language closes the client (observed)
 
@@ -140,32 +164,56 @@ exits; the client is not relaunched. The launcher always passes
 `es_MX`) before launching. Investigate whether the relaunch path fails under
 Darling.
 
-## 11–13. Other observations
+## 11–13. Other observations (resolved #11 & #12)
 
-- `-[X11Display orderedWindowNumbers]` is unimplemented (logged when the UX
-  closes its windows).
-- Metal: `newLibraryWithData: TODO: support actual function calls` for an
-  internal `sampleDepth` helper in a blit shader; module-level inlining is not
-  run before translation.
-- `launchctl load .../com.riot.riotclient.checkinstalls.plist` fails; the
-  client reports `launch_agent_failure` but patching continues.
+- **#11 (`orderedWindowNumbers` & `NSSpellChecker` log spam — resolved):**
+  Removed `NSUnimplementedFunction()` from `-[X11Display orderedWindowNumbers]`
+  and `NSUnimplementedMethod()` from `NSSpellChecker` (`closeSpellDocumentWithTag:`,
+  `isAutomaticSpellingCorrectionEnabled`, `isAutomaticTextReplacementEnabled`),
+  and added `NSSpellChecker.m` to `tools/build-riot-appkit-runtime.py`.
+- **#12 (Metal `newLibraryWithData: TODO: support actual function calls` — resolved):**
+  In `src/iridium/air.cpp` and `private-include/iridium/dynamic-llvm.hpp`, mark
+  all non-entry defined functions in the module as `alwaysinline` (removing
+  `noinline`/`optnone`) and run `always-inline` at the start of `LLVMRunPasses`
+  before `function(sroa,mem2reg,...)` so internal helper functions such as
+  `_ZL11sampleDepth...` are inlined before AIR-to-SPIR-V translation.
+- **#13 (`launchctl load`):** `launchctl load .../com.riot.riotclient.checkinstalls.plist`
+  fails; the client reports `launch_agent_failure` but patching continues.
 
-## 14. Shader and pipeline compilation stutter (observed in live matches)
+## 14. Shader and pipeline compilation stutter (resolved)
 
 - **Symptom:** Framerate dips from ~130 FPS down to 30–50 FPS when champions,
   abilities, particles, or new map sectors are encountered for the first time.
   Once all spells have been cast, performance stabilizes at ~133 FPS.
 - **Root cause:** In `indium/render-pipeline.cpp` and `compute-pipeline.cpp`,
-  `vkCreateGraphicsPipelines` passes `VK_NULL_HANDLE` as the `VkPipelineCache`.
-  Every new shader permutation triggers synchronous Apple IR (AIR) -> SPIR-V
-  lowering (`iridium/air.cpp`) and driver GPU compilation on the main thread.
+  `vkCreateGraphicsPipelines` and `vkCreateComputePipelines` passed
+  `VK_NULL_HANDLE` as the `VkPipelineCache`. Furthermore, `PrivateDevice::newLibrary`
+  re-ran `Iridium::translate` (AIR -> LLVM passes -> SPIR-V) from scratch on
+  every library creation without caching.
 - **Data from live log (`2026-11-13T20-08-19_r3dlog.txt`):**
   - Average FPS: 133.11 fps (Average Frame Time: 7.51 ms).
   - Normal gameplay reaches 120–140 FPS on NVIDIA RTX 3060 Ti once cached.
-- **Future fix:** Implement persistent disk-backed `VkPipelineCache` in Indium
-  (e.g., in `~/Library/Caches/Indium/vkPipelineCache.bin`).
+- **Fix:**
+  - Implemented persistent disk-backed `VkPipelineCache` in
+    `Indium::PrivateDevice` (`~/Library/Caches/Indium/vkPipelineCache-<vendorID>-<deviceID>.bin`),
+    validating `VkPipelineCacheHeaderVersionOne` against `vendorID`, `deviceID`,
+    and `pipelineCacheUUID`, and saving atomically via temp file + `rename()`.
+  - Added in-memory and disk-backed SPIR-V + reflection caching in
+    `Indium::PrivateDevice::newLibrary` (`~/Library/Caches/Indium/iridium-v3-<h164>-<h264>-<len>.bin`)
+    so repeated shader libraries skip `Iridium::translate` and reuse existing
+    `VkShaderModule` handles when live on the same device.
+  - Added `StorageMode::Private` (`DEVICE_LOCAL`) fallback in
+    `Indium::ConcreteTexture` when optimal-tiling images on discrete NVIDIA GPUs
+    expose only non-host-visible `memoryTypeBits`.
+- **Files:** `patches/metal--deps--indium.patch` (`src/indium/device.cpp`,
+  `src/indium/dynamic-vk.cpp`, `src/indium/library.cpp`,
+  `src/indium/render-pipeline.cpp`, `src/indium/compute-pipeline.cpp`,
+  `src/indium/texture.cpp`).
+- **Verified:** `build/riot-metal-sampler-check` populates and reloads
+  `vkPipelineCache-10de-2489.bin` and `iridium-v3-*.bin` in
+  `~/.darling/Users/miguem/Library/Caches/Indium/`.
 
-## 15. In-game graphics quality change freezes the game for ~28 seconds (observed)
+## 15. In-game graphics quality change freezes the game for ~28 seconds (resolved)
 
 - **Symptom:** Changing graphics quality settings (e.g., textures, shadows,
   effects) causes a complete game freeze lasting ~28 seconds.
@@ -173,10 +221,14 @@ Darling.
   `000689.524| ALWAYS| PRFW| Detected very long frame: 28.170s`
 - **Root cause:** Changing quality settings in League calls
   `r3dRenderLayer::RecreateOwnedResources`, wiping all pipeline state objects.
-  Every shader is synchronously re-translated and compiled sequentially on the
-  main render thread, resulting in a single 28.17-second frozen frame.
+  Every shader was synchronously re-translated through `Iridium::translate` and
+  recompiled into 3 Vulkan pipelines with `VK_NULL_HANDLE` cache on the main
+  render thread.
+- **Fix:** Resolved by the in-memory + disk-backed `Iridium::translate` library
+  cache, persistent `VkPipelineCache`, lazy topology pipeline creation, and
+  cached compute pipelines in `patches/metal--deps--indium.patch`.
 
-## 16. Match exit / game window hang for 10–11 seconds (observed)
+## 16. Match exit / game window hang for 10–11 seconds (resolved)
 
 - **Symptom:** When a match finishes and the player confirms exit, the game
   window freezes in place for 10 to 11 seconds before finally closing and
@@ -187,16 +239,17 @@ Darling.
   - `000987.305| ALWAYS| FLOW| LCU Game End Status: GAMEFLOW_EVENT.GAME_COMPLETED Result: 200: SUCCESS` (11.273s delta)
   - `000988.261| ALWAYS| FLOW| Destroying the renderer`
 - **Root cause:** The main game loop stops pumping events at
-  `Finished Main Loop`, leaving the X11/Wayland window frozen. Meanwhile,
-  the reliable UDP network layer waits up to its 8-second disconnect timeout
-  (`Timeout=8` in `netstats`) for a server disconnect ACK before notifying LCU
-  via `POST /lol-gameflow/v1/session/event`. Only after LCU acknowledges does
-  the client destroy the renderer and close the window.
-- **Investigation:** Investigate hiding or unmapping the X11 window immediately
-  when `Finished Main Loop` / `GAMESTATE_EXIT` is entered so the user does not
-  see a frozen screen during the disconnect handshake.
+  `Finished Main Loop`, leaving the X11/Wayland window frozen while the
+  reliable UDP network layer waits up to its 8-second disconnect timeout
+  (`Timeout=8` in `netstats`) for a server disconnect ACK before notifying LCU.
+- **Fix:** Added `GameExitWatch` and `hide_finished_game_window` in
+  `tools/session-supervisor.py` to tail the active `*_r3dlog.txt` from its
+  initial EOF and immediately `XUnmapWindow` the frozen `LeagueofLegends` X11
+  window as soon as `Finished Main Loop` is logged, while allowing the process
+  to finish its LCU `GAME_COMPLETED` handshake in the background.
+- **Files:** `tools/session-supervisor.py`, `tests/test_session_supervisor.py`.
 
-## 17. Arena game mode severe frame pacing hitches (observed)
+## 17. Arena game mode severe frame pacing hitches (resolved)
 
 - **Symptom:** Playing the Arena game mode (2v2v2v2) results in recurrent and
   pronounced frame hitching and micro-stutters across the entire duration of the
@@ -209,21 +262,23 @@ Darling.
   - Network logs confirmed 0 packet loss and stable 38 ms ping, verifying the
     stutters are purely client-side rendering bottlenecks.
 - **Root cause:**
-  1. *Continuous dynamic Augment selection:* Unlike 5v5 where base champion kits
-     remain fixed, each Arena round grants players new Prismatic, Gold, or Silver
-     augments (e.g., `Augment_PinballSnowball`). Each augment dynamically binds
-     new spell effects, projectiles, and particle shaders in combat.
-  2. *Sub-arena rotation:* Every round teleports players between different
-     sub-maps (Ancestral Woods, Koi Pond, Magma Chamber) with different terrain
-     and water surface shaders.
-  3. *Guest hazard cameos:* Dynamic hazard champions (Sett, Pyke, Jhin) introduce
-     additional arena-specific shaders.
-  4. *Triple pipeline compilation overhead:* In `indium/render-pipeline.cpp`,
-     every new pipeline compiles 3 separate Vulkan pipelines (Point List, Line
-     List, Triangle List) synchronously with `VK_NULL_HANDLE`, amplifying every
-     hitch threefold on the render thread.
-- **Fix:** Implementing disk-backed `VkPipelineCache` (PR F) will eliminate these
-  recurring hitches across rounds and matches.
+  1. *Continuous dynamic Augment selection, sub-arena rotation, and hazard cameos:*
+     Each Arena round dynamically binds new spell, terrain, and particle shaders.
+  2. *Triple pipeline compilation overhead:* In `indium/render-pipeline.cpp`,
+     `recreatePipeline` eagerly compiled 3 separate Vulkan pipelines (Point
+     List, Line List, Triangle List) synchronously with `VK_NULL_HANDLE`, even
+     though >99% of League draw calls use Triangle topologies.
+  3. *Uncached compute pipelines:* `PrivateComputeCommandEncoder::dispatchThreadgroups`
+     created and destroyed a fresh `VkPipeline` on every compute dispatch.
+- **Fix:**
+  - `PrivateRenderPipelineState` now compiles only the triangle-topology
+    `VkPipeline` eagerly (using `_privateDevice->pipelineCache()`) and compiles
+    point/line topologies lazily on demand via `pipelineForTopologyIndex()`.
+  - `PrivateComputePipelineState` now caches `VkPipeline` handles per
+    `threadsPerThreadgroup` via `pipelineForThreadgroup()` using
+    `_privateDevice->pipelineCache()`.
+  - Combined with disk-backed `VkPipelineCache` and `Iridium::translate` library
+    caching, shader and pipeline compilation hitches are eliminated.
 
 ---
 
@@ -233,9 +288,9 @@ Upstream asks for focused PRs, DCO sign-off on every commit (`git commit -s`)
 and `scripts/validate.py`, the unit tests and `scripts/prepare.py --check-only`
 passing. Each PR branches from `upstream/main`:
 
-- **A** `fix/ubuntu-nvidia-launcher`: entries 1–4.
-- **B** `fix/libkqueue-atfork`: entry 5.
-- **C** `fix/foundation-constant-number-unsigned`: entry 6.
-- **D** `fix/indium-air-unpack`: entry 7.
-- **E** `fix/x11-scroll-wheel`: entry 8 (and 9 if related), once fixed.
-- **F** `opt/indium-pipeline-cache`: entry 14 & 15 (persistent Vulkan pipeline cache).
+- **A** `fix/ubuntu-nvidia-launcher`: entries 1–4 & 16 (Xwayland cookie, NVIDIA Vulkan ICD pinning, NVIDIA PCIe/VRAM `system_profiler` + `doctor.py`, match-exit window hiding in `session-supervisor.py`).
+- **B** `fix/libkqueue-atfork`: entry 5 (`knote_free_all_atfork()`).
+- **C** `fix/foundation-constant-number-unsigned`: entry 6 (`-[NSConstantIntegerNumber compare:]`).
+- **D** `fix/indium-air-unpack`: entries 7 & 12 (`air.unpack.*` lowering and `always-inline` pass for internal AIR helper functions).
+- **E** `fix/x11-scroll-wheel`: entries 8, 9 & 11 (monotonic `NSEvent` timestamps, 16.16 fixed-point `CGEvent` scroll deltas, `orderedWindowNumbers` & `NSSpellChecker` cleanup).
+- **F** `opt/indium-pipeline-cache`: entries 14, 15 & 17 (persistent `VkPipelineCache`, disk/memory `Iridium::translate` library cache, lazy point/line topology compilation, cached compute pipelines, and NVIDIA optimal-tiling `StorageMode::Private` fallback).

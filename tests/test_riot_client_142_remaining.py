@@ -271,6 +271,33 @@ int main(void) {
         corefoundation = added_lines((ROOT / 'patches/corefoundation.patch').read_text())
         self.assertEqual(corefoundation.count('NSString *const NSURLContentTypeKey'), 1)
 
+    def test_scroll_wheel_events_use_monotonic_timestamps_and_fixed_point_cg_deltas(self):
+        nsevent = added_lines(patch_section('patches/cocotron.patch', 'AppKit/NSEvent.subproj/NSEvent.m'))
+        self.assertIn('darlingSystemUptime(void)', nsevent)
+        self.assertIn('mach_absolute_time()', nsevent)
+        mouse = added_lines(patch_section('patches/cocotron.patch', 'AppKit/NSEvent.subproj/NSEvent_mouse.m'))
+        self.assertIn('CGEventSetIntegerValueField(event, kCGScrollWheelEventIsContinuous, 0);', mouse)
+        cgevent = added_lines(patch_section('patches/cocotron.patch', 'CoreGraphics/CGEvent.m'))
+        self.assertIn('numberWithLongLong: (int64_t)wheel1 * 0x00010000', cgevent)
+        appkit_builder = (ROOT / 'tools/build-riot-appkit-runtime.py').read_text()
+        self.assertIn("'NSSpellChecker'", appkit_builder)
+
+    def test_indium_caches_vulkan_pipelines_translated_libraries_and_inlines_air_helpers(self):
+        air = added_lines(patch_section('patches/metal--deps--indium.patch', 'src/iridium/air.cpp'))
+        self.assertIn('always-inline,function(sroa,mem2reg,', air)
+        device = added_lines(patch_section('patches/metal--deps--indium.patch', 'src/indium/device.cpp'))
+        self.assertIn('void Indium::PrivateDevice::initPipelineCache()', device)
+        self.assertIn('void Indium::PrivateDevice::savePipelineCache()', device)
+        self.assertIn('loadTranslatedLibraryFromDisk', device)
+        self.assertIn('saveTranslatedLibraryToDisk', device)
+        render_pipeline = added_lines(patch_section('patches/metal--deps--indium.patch', 'src/indium/render-pipeline.cpp'))
+        self.assertIn('VkPipeline Indium::PrivateRenderPipelineState::pipelineForTopologyIndex(size_t index)', render_pipeline)
+        self.assertIn('_privateDevice->pipelineCache()', render_pipeline)
+        compute_pipeline = added_lines(patch_section('patches/metal--deps--indium.patch', 'src/indium/compute-pipeline.cpp'))
+        self.assertIn('_cachedPipelines.emplace_back(threadsPerThreadgroup, pipeline);', compute_pipeline)
+        texture = added_lines(patch_section('patches/metal--deps--indium.patch', 'src/indium/texture.cpp'))
+        self.assertIn('targetIndex = _device->findMemoryType(reqs.memoryTypeBits, StorageMode::Private, true);', texture)
+
 
 if __name__ == '__main__':
     unittest.main()
