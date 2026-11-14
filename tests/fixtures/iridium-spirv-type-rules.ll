@@ -1,6 +1,7 @@
 ; Synthetic AIR kernel for tests/test_iridium_spirv_type_rules.py. Each value exercises one
 ; SPIR-V type rule: narrow integer constants in an i8 array and an i16 add, a constant GEP
-; into a Private global aggregate, i1 equality (scalar and vector) and sign-extended i1.
+; into a Private global aggregate, i1 equality (scalar and vector), sign- and zero-extended
+; i1 (scalar and vector) and truncation to i1 (scalar and vector).
 target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
 target triple = "air64-apple-macosx14.0.0"
 
@@ -25,6 +26,11 @@ entry:
   %vb = insertelement <2 x i1> %vb0, i1 %eq, i32 1
   %veq = icmp eq <2 x i1> %va, %vb
   %vs = sext <2 x i1> %veq to <2 x i32>
+  %vz = zext <2 x i1> %veq to <2 x i32>
+  %t = trunc i32 %x to i1
+  %tz = zext i1 %t to i32
+  %vt = trunc <2 x i32> %vz to <2 x i1>
+  %vtz = zext <2 x i1> %vt to <2 x i16>
   ret void
 }
 

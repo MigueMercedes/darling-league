@@ -101,6 +101,13 @@ def type_rule_violations(module):
             violations.append(f'OpIEqual/OpINotEqual on {describe(value_type[operands[2]])}')
         elif opcode in (113, 114) and is_boolean(value_type[operands[2]]):
             violations.append(f'integer conversion of {describe(value_type[operands[2]])}')
+        elif opcode in (113, 114) and is_boolean(operands[0]):
+            violations.append(f'integer conversion to {describe(operands[0])}')
+        elif opcode == 169:  # OpSelect
+            for operand in operands[3:]:
+                if value_type[operand] != operands[0]:
+                    violations.append(f'OpSelect of {describe(operands[0])} takes '
+                                      f'{describe(value_type[operand])}')
         elif opcode == 65:  # OpAccessChain
             selected = types[value_type[operands[2]]][1][1]
             for chain_index in operands[3:]:
