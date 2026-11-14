@@ -818,10 +818,15 @@ index 8546daa..5d2e98d 100644
  		void updateBindings();
  
 diff --git a/private-include/indium/device.private.hpp b/private-include/indium/device.private.hpp
-index 58f1794..a552dfb 100644
+index 58f1794..de12329 100644
 --- a/private-include/indium/device.private.hpp
 +++ b/private-include/indium/device.private.hpp
-@@ -13,6 +13,8 @@
+@@ -10,9 +10,13 @@
+ 
+ #include <vector>
+ #include <mutex>
++#include <condition_variable>
++#include <thread>
  #include <functional>
  #include <atomic>
  #include <optional>
@@ -830,7 +835,7 @@ index 58f1794..a552dfb 100644
  
  namespace Indium {
  	class PrivateDevice;
-@@ -25,8 +27,11 @@ namespace Indium {
+@@ -25,8 +29,11 @@ namespace Indium {
  	class PrivateDevice: public Device, public std::enable_shared_from_this<PrivateDevice> {
  	private:
  
@@ -842,7 +847,7 @@ index 58f1794..a552dfb 100644
  
  		// these are stored separately (rather than in a single structure)
  		// so that we can easily copy them individually in the event loop polling function.
-@@ -59,6 +64,8 @@ namespace Indium {
+@@ -59,6 +66,8 @@ namespace Indium {
  		}
  
  		virtual std::string name() const override;
@@ -851,7 +856,7 @@ index 58f1794..a552dfb 100644
  		virtual std::shared_ptr<CommandQueue> newCommandQueue() override;
  		virtual std::shared_ptr<RenderPipelineState> newRenderPipelineState(const RenderPipelineDescriptor& descriptor) override;
  		virtual std::shared_ptr<ComputePipelineState> newComputePipelineState(const ComputePipelineDescriptor& descriptor, PipelineOption options, std::shared_ptr<ComputePipelineReflection> reflection) override;
-@@ -73,6 +80,13 @@ namespace Indium {
+@@ -73,6 +82,13 @@ namespace Indium {
  		virtual void pollEvents(uint64_t timeoutNanoseconds) override;
  		virtual void wakeupEventLoop() override;
  
@@ -865,7 +870,7 @@ index 58f1794..a552dfb 100644
  		void waitForSemaphore(VkSemaphore semaphore, uint64_t targetValue, std::function<void()> callback);
  
  		/**
-@@ -86,6 +100,11 @@ namespace Indium {
+@@ -86,6 +102,11 @@ namespace Indium {
  		 * Similar to getTimelineSemaphore(), but wraps it in a shared pointer
  		 * that automatically releases the semaphore when all references to it die out.
  		 */
@@ -877,7 +882,7 @@ index 58f1794..a552dfb 100644
  		std::shared_ptr<TimelineSemaphore> getWrappedTimelineSemaphore();
  
  		BinarySemaphore getBinarySemaphore(bool exportable = false);
-@@ -111,5 +130,44 @@ namespace Indium {
+@@ -111,5 +132,55 @@ namespace Indium {
  
  		INDIUM_PROPERTY(VkPhysicalDeviceMemoryProperties, m, M,emoryProperties);
  		INDIUM_PROPERTY_READONLY(Feature, f, F,eatures);
@@ -900,6 +905,9 @@ index 58f1794..a552dfb 100644
 +		void releaseDescriptorPool(VkDescriptorPool pool);
 +		// Cached handles belong to the device and remain alive through all GPU uses.
 +		std::pair<VkRenderPass, bool> acquireRenderPass(const VkRenderPassCreateInfo& info);
++		// A device-owned pass for prewarming pipelines, kept apart from the encoder passes so it never
++		// takes their cache slots. VK_NULL_HANDLE when the description is unusual or the set is full.
++		VkRenderPass acquirePrewarmRenderPass(const VkRenderPassCreateInfo& info);
 +		// Memory type index for a buffer or image of the given storage mode, or SIZE_MAX. Non-virtual and without
 +		// state in the class, so the layout above is unchanged.
 +		size_t findMemoryType(uint32_t memoryTypeBits, StorageMode storageMode, bool image);
@@ -919,7 +927,15 @@ index 58f1794..a552dfb 100644
 +		void savePipelineCache();
 +	private:
 +		void initPipelineCache();
++		void pipelineCacheSaverLoop();
 +		VkPipelineCache _pipelineCache = VK_NULL_HANDLE;
++		// Writes the pipeline cache to disk off the threads that create pipelines (see notePipelineCreated).
++		std::mutex _cacheSaverMutex;
++		std::condition_variable _cacheSaverCv;
++		std::thread _cacheSaver;
++		bool _cacheSaverPending = false;
++		bool _cacheSaverStop = false;
++		std::unordered_map<RenderPassKey, VkRenderPass, RenderPassKey::Hash> _prewarmRenderPasses;
  	};
  };
 diff --git a/private-include/indium/dynamic-vk.hpp b/private-include/indium/dynamic-vk.hpp
@@ -1075,18 +1091,20 @@ index a43f532..6f2d7dd 100644
  				binding.stageFlags = functionTypeToVkShaderStageFlags(function->functionInfo().functionType);
  			}
 diff --git a/private-include/indium/render-command-encoder.private.hpp b/private-include/indium/render-command-encoder.private.hpp
-index a41b951..136c571 100644
+index a41b951..33d179c 100644
 --- a/private-include/indium/render-command-encoder.private.hpp
 +++ b/private-include/indium/render-command-encoder.private.hpp
-@@ -5,12 +5,15 @@
+@@ -5,12 +5,17 @@
  #include <indium/sampler.private.hpp>
  #include <indium/device.hpp>
  #include <indium/command-encoder.private.hpp>
 +#include <indium/resource-owner-cache.private.hpp>
++#include <indium/render-pass-key.private.hpp>
  
  #include <vulkan/vulkan.h>
  
  #include <array>
++#include <optional>
  #include <variant>
  #include <vector>
 +#include <unordered_set>
@@ -1094,7 +1112,7 @@ index a41b951..136c571 100644
  
  namespace Indium {
  	class PrivateCommandBuffer;
-@@ -26,22 +29,46 @@ namespace Indium {
+@@ -26,22 +31,48 @@ namespace Indium {
  		std::weak_ptr<PrivateCommandBuffer> _privateCommandBuffer;
  		std::shared_ptr<PrivateDevice> _privateDevice;
  		std::shared_ptr<PrivateRenderPipelineState> _privatePSO;
@@ -1102,6 +1120,8 @@ index a41b951..136c571 100644
 +        VkExtent2D _traceExtent {};
  		VkFramebuffer _framebuffer = VK_NULL_HANDLE;
  		VkRenderPass _renderPass = VK_NULL_HANDLE;
++		// Compatibility signature of _renderPass, checked against prewarmed pipelines.
++		std::optional<RenderPassCompatKey> _renderPassCompat;
  		VkDescriptorPool _pool = VK_NULL_HANDLE;
 +        std::vector<VkDescriptorPool> _retiredPools;
  
@@ -1145,7 +1165,7 @@ index a41b951..136c571 100644
  		virtual void setFrontFacingWinding(Winding frontFaceWinding) override;
  		virtual void setCullMode(CullMode cullMode) override;
  		virtual void setDepthBias(float depthBias, float slopeScale, float clamp) override;
-@@ -53,7 +80,7 @@ namespace Indium {
+@@ -53,7 +84,7 @@ namespace Indium {
  		virtual void setScissorRects(const ScissorRect* scissorRects, size_t count) override;
  		virtual void setScissorRects(const std::vector<ScissorRect>& scissorRects) override;
  		virtual void setBlendColor(float red, float green, float blue, float alpha) override;
@@ -1154,7 +1174,7 @@ index a41b951..136c571 100644
  		virtual void setTriangleFillMode(TriangleFillMode triangleFillMode) override;
  		virtual void setStencilReferenceValue(uint32_t value) override;
  		virtual void setStencilReferenceValue(uint32_t front, uint32_t back) override;
-@@ -63,30 +90,30 @@ namespace Indium {
+@@ -63,30 +94,30 @@ namespace Indium {
  		virtual void drawPrimitives(PrimitiveType primitiveType, size_t vertexStart, size_t vertexCount, size_t instanceCount) override;
  		virtual void drawPrimitives(PrimitiveType primitiveType, size_t vertexStart, size_t vertexCount) override;
  
@@ -1196,7 +1216,7 @@ index a41b951..136c571 100644
  		virtual void setFragmentTextures(std::vector<std::shared_ptr<Texture>>& textures, Range<size_t> range) override;
  
  		virtual void useResource(std::shared_ptr<Resource> resource, ResourceUsage usage, RenderStages stages) override;
-@@ -95,8 +122,89 @@ namespace Indium {
+@@ -95,8 +126,89 @@ namespace Indium {
  		virtual void useResources(const std::vector<std::shared_ptr<Resource>>& resources, ResourceUsage usage) override;
  
  		virtual void endEncoding() override;
@@ -2973,7 +2993,7 @@ index 5f62ad0..a2906f3 100644
  	DynamicVK::vkCmdBindDescriptorSets(buf->commandBuffer(), VK_PIPELINE_BIND_POINT_COMPUTE, _pso->layout(), 0, descriptorSets.size(), descriptorSets.data(), 0, nullptr);
  };
 diff --git a/src/indium/device.cpp b/src/indium/device.cpp
-index 322e186..4db08bf 100644
+index 322e186..e3e3855 100644
 --- a/src/indium/device.cpp
 +++ b/src/indium/device.cpp
 @@ -1,4 +1,10 @@
@@ -3301,11 +3321,11 @@ index 322e186..4db08bf 100644
 +			}
 +			creationOrder.push_back(i);
 +		}
-+	}
+ 	}
 +
 +	for (size_t index: creationOrder) {
 +		globalDeviceList.push_back(std::make_shared<PrivateDevice>(candidates[index].device));
- 	}
++	}
 +
 +	appendDeviceLog("created VkDevice for " + std::to_string(globalDeviceList.size()) + " of "
 +		+ std::to_string(candidates.size()) + " supported device(s)"
@@ -3376,7 +3396,7 @@ index 322e186..4db08bf 100644
  
  	for (const auto& index: queueFamilyIndices) {
  		VkQueue queue;
-@@ -294,9 +604,380 @@ Indium::PrivateDevice::PrivateDevice(VkPhysicalDevice physicalDevice):
+@@ -294,9 +604,429 @@ Indium::PrivateDevice::PrivateDevice(VkPhysicalDevice physicalDevice):
  			abort();
  		}
  	}
@@ -3706,12 +3726,42 @@ index 322e186..4db08bf 100644
 +
 +void Indium::PrivateDevice::notePipelineCreated() {
 +	if (!_pipelineCache) return;
-+	auto& state = pipelineCacheState();
-+	uint32_t pending = state.unsaved.fetch_add(1, std::memory_order_relaxed) + 1;
-+	uint64_t now = monotonicNs();
-+	uint64_t last = state.lastSaveNs.load(std::memory_order_relaxed);
-+	if (pending >= 8 || last == 0 || (now > last && (now - last) >= 250000000ULL)) {
++	pipelineCacheState().unsaved.fetch_add(1, std::memory_order_relaxed);
++	// Serialising the whole cache (vkGetPipelineCacheData) and writing it out used to run here, on the
++	// thread that had just created a pipeline (the submit thread during replay), every 8 pipelines or
++	// 250 ms: during a burst of first-seen shaders that added a full cache dump to the stalls. A saver
++	// thread now does it once a burst settles.
++	{
++		std::lock_guard<std::mutex> lock(_cacheSaverMutex);
++		if (_cacheSaverStop) return;
++		_cacheSaverPending = true;
++		if (!_cacheSaver.joinable()) {
++			_cacheSaver = std::thread([this] { pipelineCacheSaverLoop(); });
++		}
++	}
++	_cacheSaverCv.notify_one();
++}
++
++void Indium::PrivateDevice::pipelineCacheSaverLoop() {
++	using namespace std::chrono_literals;
++	std::unique_lock<std::mutex> lock(_cacheSaverMutex);
++	for (;;) {
++		_cacheSaverCv.wait(lock, [this] { return _cacheSaverStop || _cacheSaverPending; });
++		if (_cacheSaverStop) return;
++		// Save when no pipeline has been created for 500 ms, or 2 s into a continuous burst, so a
++		// match that ends abruptly loses at most the last couple of seconds of new pipelines.
++		const auto deadline = std::chrono::steady_clock::now() + 2s;
++		for (;;) {
++			_cacheSaverPending = false;
++			const auto until = std::min(std::chrono::steady_clock::now() + 500ms, deadline);
++			const bool more = _cacheSaverCv.wait_until(lock, until, [this] { return _cacheSaverStop || _cacheSaverPending; });
++			if (_cacheSaverStop) return;
++			if (!more || std::chrono::steady_clock::now() >= deadline) break;
++		}
++		_cacheSaverPending = false;
++		lock.unlock();
 +		savePipelineCache();
++		lock.lock();
 +	}
 +}
 +
@@ -3719,15 +3769,21 @@ index 322e186..4db08bf 100644
 +	if (!_pipelineCache || !DynamicVK::vkGetPipelineCacheData.isAvailable()) return;
 +	auto& state = pipelineCacheState();
 +	std::lock_guard<std::mutex> lock(state.mutex);
-+	if (state.path.empty() || state.unsaved.load(std::memory_order_relaxed) == 0) return;
++	if (state.path.empty()) return;
++	// Claim the pending count before reading the cache: a pipeline created meanwhile counts towards
++	// the next save instead of being cleared by this one.
++	const uint32_t claimed = state.unsaved.exchange(0, std::memory_order_relaxed);
++	if (claimed == 0) return;
 +
 +	size_t dataSize = 0;
 +	if (DynamicVK::vkGetPipelineCacheData(_device, _pipelineCache, &dataSize, nullptr) != VK_SUCCESS ||
 +	    dataSize < sizeof(VkPipelineCacheHeaderVersionOne)) {
++		state.unsaved.fetch_add(claimed, std::memory_order_relaxed);
 +		return;
 +	}
 +	std::vector<uint8_t> data(dataSize);
 +	if (DynamicVK::vkGetPipelineCacheData(_device, _pipelineCache, &dataSize, data.data()) != VK_SUCCESS) {
++		state.unsaved.fetch_add(claimed, std::memory_order_relaxed);
 +		return;
 +	}
 +	std::string tmpPath = state.path + ".tmp." + std::to_string(getpid());
@@ -3735,15 +3791,27 @@ index 322e186..4db08bf 100644
 +		bool ok = fwrite(data.data(), 1, dataSize, f) == dataSize;
 +		fclose(f);
 +		if (ok && rename(tmpPath.c_str(), state.path.c_str()) == 0) {
-+			state.unsaved.store(0, std::memory_order_relaxed);
 +			state.lastSaveNs.store(monotonicNs(), std::memory_order_relaxed);
 +			return;
 +		}
 +	}
 +	unlink(tmpPath.c_str());
++	state.unsaved.fetch_add(claimed, std::memory_order_relaxed);
 +}
 +
  Indium::PrivateDevice::~PrivateDevice() {
++	{
++		std::lock_guard<std::mutex> lock(_cacheSaverMutex);
++		_cacheSaverStop = true;
++	}
++	_cacheSaverCv.notify_all();
++	if (_cacheSaver.joinable()) {
++		if (_cacheSaver.get_id() == std::this_thread::get_id()) {
++			_cacheSaver.detach();
++		} else {
++			_cacheSaver.join();
++		}
++	}
 +	if (_pipelineCache) {
 +		savePipelineCache();
 +		if (DynamicVK::vkDestroyPipelineCache.isAvailable()) {
@@ -3752,12 +3820,13 @@ index 322e186..4db08bf 100644
 +		_pipelineCache = VK_NULL_HANDLE;
 +	}
 +    for (const auto& entry : _renderPasses) DynamicVK::vkDestroyRenderPass(_device, entry.second, nullptr);
++    for (const auto& entry : _prewarmRenderPasses) DynamicVK::vkDestroyRenderPass(_device, entry.second, nullptr);
 +    for (const auto& entry : _availableTimelineSemaphores) DynamicVK::vkDestroySemaphore(_device, entry.first, nullptr);
 +	for (auto pool : _availableDescriptorPools) DynamicVK::vkDestroyDescriptorPool(_device, pool, nullptr);
  	if (_oneshotCommandPool) {
  		DynamicVK::vkDestroyCommandPool(_device, _oneshotCommandPool, nullptr);
  	}
-@@ -308,6 +989,23 @@ std::string Indium::PrivateDevice::name() const {
+@@ -308,18 +1038,52 @@ std::string Indium::PrivateDevice::name() const {
  	return _properties.deviceName;
  };
  
@@ -3778,10 +3847,30 @@ index 322e186..4db08bf 100644
 +    return {pass, key.has_value()};
 +}
 +
++VkRenderPass Indium::PrivateDevice::acquirePrewarmRenderPass(const VkRenderPassCreateInfo& info) {
++    auto key = renderPassKey(info);
++    if (!key) return VK_NULL_HANDLE;
++    std::lock_guard<std::mutex> lock(_renderPassMutex);
++    auto found = _prewarmRenderPasses.find(*key);
++    if (found != _prewarmRenderPasses.end()) return found->second;
++    // Never evicted (pipelines keep referring to them for lazy topology variants); one per
++    // attachment-format combination, so the bound is not reached in practice.
++    if (_prewarmRenderPasses.size() >= 256) return VK_NULL_HANDLE;
++    VkRenderPass pass = VK_NULL_HANDLE;
++    if (DynamicVK::vkCreateRenderPass(_device, &info, nullptr, &pass) != VK_SUCCESS) return VK_NULL_HANDLE;
++    _prewarmRenderPasses.emplace(*key, pass);
++    return pass;
++}
++
  std::shared_ptr<Indium::CommandQueue> Indium::PrivateDevice::newCommandQueue() {
  	return std::make_shared<PrivateCommandQueue>(shared_from_this());
  };
-@@ -317,9 +1015,9 @@ std::shared_ptr<Indium::RenderPipelineState> Indium::PrivateDevice::newRenderPip
+ 
+ std::shared_ptr<Indium::RenderPipelineState> Indium::PrivateDevice::newRenderPipelineState(const RenderPipelineDescriptor& descriptor) {
+-	return std::make_shared<PrivateRenderPipelineState>(shared_from_this(), descriptor);
++	auto state = std::make_shared<PrivateRenderPipelineState>(shared_from_this(), descriptor);
++	PrivateRenderPipelineState::schedulePrewarm(state);
++	return state;
  };
  
  std::shared_ptr<Indium::ComputePipelineState> Indium::PrivateDevice::newComputePipelineState(const ComputePipelineDescriptor& descriptor, PipelineOption options, std::shared_ptr<ComputePipelineReflection> reflection) {
@@ -3794,7 +3883,7 @@ index 322e186..4db08bf 100644
  	return std::make_shared<PrivateComputePipelineState>(shared_from_this(), descriptor);
  };
  
-@@ -336,10 +1034,54 @@ std::shared_ptr<Indium::Buffer> Indium::PrivateDevice::newBuffer(const void* poi
+@@ -336,10 +1100,54 @@ std::shared_ptr<Indium::Buffer> Indium::PrivateDevice::newBuffer(const void* poi
  };
  
  std::shared_ptr<Indium::Library> Indium::PrivateDevice::newLibrary(const void* data, size_t length) {
@@ -3853,7 +3942,7 @@ index 322e186..4db08bf 100644
  	PrivateLibrary::FunctionInfoMap funcInfoMap;
  
  	for (const auto& [name, info]: outputInfo.functionInfos) {
-@@ -357,12 +1099,43 @@ std::shared_ptr<Indium::Library> Indium::PrivateDevice::newLibrary(const void* d
+@@ -357,12 +1165,43 @@ std::shared_ptr<Indium::Library> Indium::PrivateDevice::newLibrary(const void* d
  				break;
  		}
  
@@ -3899,7 +3988,7 @@ index 322e186..4db08bf 100644
  	return lib;
  };
  
-@@ -382,6 +1155,19 @@ std::shared_ptr<Indium::Device> Indium::createSystemDefaultDevice() {
+@@ -382,6 +1221,19 @@ std::shared_ptr<Indium::Device> Indium::createSystemDefaultDevice() {
  	return globalDeviceList.empty() ? nullptr : globalDeviceList.front();
  };
  
@@ -3919,7 +4008,7 @@ index 322e186..4db08bf 100644
  void Indium::PrivateDevice::pollEvents(uint64_t timeoutNanoseconds) {
  	// this is held for the entire duration of the poll so we can
  	// ensure we're the only one polling, which allows us to avoid
-@@ -393,9 +1179,35 @@ void Indium::PrivateDevice::pollEvents(uint64_t timeoutNanoseconds) {
+@@ -393,9 +1245,35 @@ void Indium::PrivateDevice::pollEvents(uint64_t timeoutNanoseconds) {
  	const std::vector<VkSemaphore> semaphores = _eventLoopSemaphores;
  	const std::vector<uint64_t> values = _eventLoopWaitValues;
  	const std::vector<std::function<void()>> callbacks = _eventLoopCallbacks;
@@ -3955,7 +4044,7 @@ index 322e186..4db08bf 100644
  	VkSemaphoreWaitInfo info {};
  	info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
  	info.semaphoreCount = semaphores.size();
-@@ -403,7 +1215,19 @@ void Indium::PrivateDevice::pollEvents(uint64_t timeoutNanoseconds) {
+@@ -403,7 +1281,19 @@ void Indium::PrivateDevice::pollEvents(uint64_t timeoutNanoseconds) {
  	info.pValues = values.data();
  	info.flags = VK_SEMAPHORE_WAIT_ANY_BIT;
  
@@ -3976,7 +4065,7 @@ index 322e186..4db08bf 100644
  
  	if (result == VK_TIMEOUT) {
  		// timed out with no semaphores ready
-@@ -474,15 +1298,30 @@ void Indium::PrivateDevice::waitForSemaphore(VkSemaphore semaphore, uint64_t tar
+@@ -474,15 +1364,30 @@ void Indium::PrivateDevice::waitForSemaphore(VkSemaphore semaphore, uint64_t tar
  		_eventLoopSemaphores.push_back(semaphore);
  		_eventLoopWaitValues.push_back(targetValue);
  		_eventLoopCallbacks.push_back(callback);
@@ -4010,7 +4099,7 @@ index 322e186..4db08bf 100644
  	VkSemaphoreTypeCreateInfo typeInfo {};
  	typeInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
  	typeInfo.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
-@@ -505,7 +1344,14 @@ Indium::TimelineSemaphore Indium::PrivateDevice::getTimelineSemaphore() {
+@@ -505,7 +1410,14 @@ Indium::TimelineSemaphore Indium::PrivateDevice::getTimelineSemaphore() {
  };
  
  void Indium::PrivateDevice::putTimelineSemaphore(const TimelineSemaphore& semaphore) {
@@ -4026,7 +4115,7 @@ index 322e186..4db08bf 100644
  };
  
  std::shared_ptr<Indium::TimelineSemaphore> Indium::PrivateDevice::getWrappedTimelineSemaphore() {
-@@ -551,3 +1397,164 @@ std::shared_ptr<Indium::BinarySemaphore> Indium::PrivateDevice::getWrappedBinary
+@@ -551,3 +1463,164 @@ std::shared_ptr<Indium::BinarySemaphore> Indium::PrivateDevice::getWrappedBinary
  		delete ptr;
  	});
  };
@@ -4381,7 +4470,7 @@ index d56a213..d416ace 100644
 +
 +const std::vector<Iridium::ArgumentInfo>& Indium::PrivateFunction::argumentInfo() const { return _functionInfo.arguments; }
 diff --git a/src/indium/render-command-encoder.cpp b/src/indium/render-command-encoder.cpp
-index b27ffe5..c9f5289 100644
+index b27ffe5..65fa920 100644
 --- a/src/indium/render-command-encoder.cpp
 +++ b/src/indium/render-command-encoder.cpp
 @@ -1,3 +1,9 @@
@@ -4529,7 +4618,7 @@ index b27ffe5..c9f5289 100644
  		auto clearColor = color.clearColor;
  		VkClearValue clearValue {};
  		clearValue.color.float32[0] = clearColor.red;
-@@ -65,36 +157,59 @@ Indium::PrivateRenderCommandEncoder::PrivateRenderCommandEncoder(std::shared_ptr
+@@ -65,36 +157,53 @@ Indium::PrivateRenderCommandEncoder::PrivateRenderCommandEncoder(std::shared_ptr
  	std::vector<VkSubpassDependency> dependencies;
  
  	for (const auto& color: descriptor.colorAttachments) {
@@ -4598,17 +4687,11 @@ index b27ffe5..c9f5289 100644
 +        while (auto parent = std::dynamic_pointer_cast<PrivateTexture>(_depthRoot->parentTexture())) _depthRoot = parent;
 +    }
 +    // League uses fragment-to-fragment barriers for texture/render-target scope.
-+    VkSubpassDependency dependency {};
-+    dependency.srcSubpass = dependency.dstSubpass = 0;
-+    dependency.srcStageMask = dependency.dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-+    dependency.srcAccessMask = dependency.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
-+        VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-+    dependency.dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
-+    dependencies.push_back(dependency);
++    dependencies.push_back(encoderSubpassDependency());
  
  	std::vector<VkAttachmentReference> colorAttachments;
  	VkAttachmentReference depthStencilAttachment {};
-@@ -102,13 +217,15 @@ Indium::PrivateRenderCommandEncoder::PrivateRenderCommandEncoder(std::shared_ptr
+@@ -102,13 +211,15 @@ Indium::PrivateRenderCommandEncoder::PrivateRenderCommandEncoder(std::shared_ptr
  	size_t index = 0;
  	for (const auto& color: descriptor.colorAttachments) {
  		VkAttachmentReference ref {};
@@ -4628,7 +4711,7 @@ index b27ffe5..c9f5289 100644
  		depthStencilAttachment.attachment = index;
  		depthStencilAttachment.layout = VK_IMAGE_LAYOUT_GENERAL;
  		++index;
-@@ -129,19 +246,19 @@ Indium::PrivateRenderCommandEncoder::PrivateRenderCommandEncoder(std::shared_ptr
+@@ -129,19 +240,20 @@ Indium::PrivateRenderCommandEncoder::PrivateRenderCommandEncoder(std::shared_ptr
  	renderPassInfo.dependencyCount = dependencies.size();
  	renderPassInfo.pDependencies = dependencies.data();
  
@@ -4636,6 +4719,7 @@ index b27ffe5..c9f5289 100644
 -		// TODO
 -		abort();
 -	}
++    _renderPassCompat = renderPassCompatKey(renderPassInfo);
 +    auto renderPassLease = _privateDevice->acquireRenderPass(renderPassInfo);
 +    _renderPass = renderPassLease.first;
 +    _renderPassDeviceOwned = renderPassLease.second;
@@ -4654,7 +4738,7 @@ index b27ffe5..c9f5289 100644
  	}
  
  	VkFramebufferCreateInfo framebufferInfo {};
-@@ -165,7 +282,51 @@ Indium::PrivateRenderCommandEncoder::PrivateRenderCommandEncoder(std::shared_ptr
+@@ -165,7 +277,51 @@ Indium::PrivateRenderCommandEncoder::PrivateRenderCommandEncoder(std::shared_ptr
  	renderPassBeginInfo.renderArea.extent.height = firstTexture->height();
  	renderPassBeginInfo.clearValueCount = clearValues.size();
  	renderPassBeginInfo.pClearValues = clearValues.data();
@@ -4707,7 +4791,7 @@ index b27ffe5..c9f5289 100644
  
  	// set default values
  
-@@ -190,16 +351,26 @@ Indium::PrivateRenderCommandEncoder::~PrivateRenderCommandEncoder() {
+@@ -190,16 +346,26 @@ Indium::PrivateRenderCommandEncoder::~PrivateRenderCommandEncoder() {
  	if (_framebuffer) {
  		DynamicVK::vkDestroyFramebuffer(_privateDevice->device(), _framebuffer, nullptr);
  	}
@@ -4734,13 +4818,13 @@ index b27ffe5..c9f5289 100644
 +    auto [entry, inserted] = _pipelineOwners.acquire(renderPipelineState);
 +    if (!entry || !entry->value) throw std::invalid_argument("Invalid render pipeline state");
 +    auto candidate = std::static_pointer_cast<PrivateRenderPipelineState>(entry->owner);
-+    candidate->recreatePipeline(_renderPass, false);
++    candidate->recreatePipeline(_renderPass, _renderPassCompat, false);
 +    if (!candidate->ready()) throw std::runtime_error("Render pipeline is incomplete");
 +    _privatePSO = std::move(candidate);
  };
  
  void Indium::PrivateRenderCommandEncoder::setFrontFacingWinding(Winding frontFaceWinding) {
-@@ -225,6 +396,7 @@ void Indium::PrivateRenderCommandEncoder::setDepthClipMode(DepthClipMode depthCl
+@@ -225,6 +391,7 @@ void Indium::PrivateRenderCommandEncoder::setDepthClipMode(DepthClipMode depthCl
  	}
  };
  
@@ -4748,7 +4832,7 @@ index b27ffe5..c9f5289 100644
  void Indium::PrivateRenderCommandEncoder::setViewport(const Viewport& viewport) {
  	setViewports(&viewport, 1);
  };
-@@ -239,7 +411,7 @@ void Indium::PrivateRenderCommandEncoder::setViewports(const Viewport* viewports
+@@ -239,7 +406,7 @@ void Indium::PrivateRenderCommandEncoder::setViewports(const Viewport* viewports
  		//       so we use a Vulkan 1.1 feature here and just flip the Y-axis of the viewport
  		//       (with a corresponding change in the origin).
  		vkViewport.x = viewport.originX;
@@ -4757,7 +4841,7 @@ index b27ffe5..c9f5289 100644
  		vkViewport.width = viewport.width;
  		vkViewport.height = -viewport.height;
  		// the documentation for setViewport and setViewports states that znear and zfar must be between
-@@ -251,6 +423,7 @@ void Indium::PrivateRenderCommandEncoder::setViewports(const Viewport* viewports
+@@ -251,6 +418,7 @@ void Indium::PrivateRenderCommandEncoder::setViewports(const Viewport* viewports
  		vkViewport.maxDepth = std::clamp(viewport.zfar, 0., 1.);
  		tmp.push_back(vkViewport);
  	}
@@ -4765,7 +4849,7 @@ index b27ffe5..c9f5289 100644
  	DynamicVK::vkCmdSetViewportWithCount(buf->commandBuffer(), tmp.size(), tmp.data());
  };
  
-@@ -274,6 +447,7 @@ void Indium::PrivateRenderCommandEncoder::setScissorRects(const ScissorRect* sci
+@@ -274,6 +442,7 @@ void Indium::PrivateRenderCommandEncoder::setScissorRects(const ScissorRect* sci
  		vkRect.extent.height = scissorRect.height;
  		tmp.push_back(vkRect);
  	}
@@ -4773,7 +4857,7 @@ index b27ffe5..c9f5289 100644
  	DynamicVK::vkCmdSetScissorWithCount(buf->commandBuffer(), tmp.size(), tmp.data());
  };
  
-@@ -287,76 +461,359 @@ void Indium::PrivateRenderCommandEncoder::setBlendColor(float red, float green,
+@@ -287,76 +456,359 @@ void Indium::PrivateRenderCommandEncoder::setBlendColor(float red, float green,
  	DynamicVK::vkCmdSetBlendConstants(buf->commandBuffer(), tmp);
  };
  
@@ -5116,17 +5200,17 @@ index b27ffe5..c9f5289 100644
  	switch (primitiveType) {
  		case PrimitiveType::Point:
 -			pipeline = _privatePSO->pipelines()[0];
-+			pipeline = _privatePSO->pipelineForTopologyIndex(0);
++			pipeline = _privatePSO->pipelineForTopologyIndex(0, _renderPass);
  			break;
  		case PrimitiveType::Line:
  		case PrimitiveType::LineStrip:
 -			pipeline = _privatePSO->pipelines()[1];
-+			pipeline = _privatePSO->pipelineForTopologyIndex(1);
++			pipeline = _privatePSO->pipelineForTopologyIndex(1, _renderPass);
  			break;
  		case PrimitiveType::Triangle:
  		case PrimitiveType::TriangleStrip:
 -			pipeline = _privatePSO->pipelines()[2];
-+			pipeline = _privatePSO->pipelineForTopologyIndex(2);
++			pipeline = _privatePSO->pipelineForTopologyIndex(2, _renderPass);
  			break;
  		default:
  			throw BadEnumValue();
@@ -5161,7 +5245,7 @@ index b27ffe5..c9f5289 100644
  };
  
  void Indium::PrivateRenderCommandEncoder::drawPrimitives(PrimitiveType primitiveType, size_t vertexStart, size_t vertexCount, size_t instanceCount) {
-@@ -368,22 +825,45 @@ void Indium::PrivateRenderCommandEncoder::drawPrimitives(PrimitiveType primitive
+@@ -368,22 +820,45 @@ void Indium::PrivateRenderCommandEncoder::drawPrimitives(PrimitiveType primitive
  };
  
  void Indium::PrivateRenderCommandEncoder::setVertexBytes(const void* bytes, size_t length, size_t index) {
@@ -5210,7 +5294,7 @@ index b27ffe5..c9f5289 100644
  	}
  };
  
-@@ -391,12 +871,14 @@ void Indium::PrivateRenderCommandEncoder::setVertexBufferOffset(size_t offset, s
+@@ -391,12 +866,14 @@ void Indium::PrivateRenderCommandEncoder::setVertexBufferOffset(size_t offset, s
  	_functionResources[0].setBufferOffset(offset, index);
  };
  
@@ -5227,7 +5311,7 @@ index b27ffe5..c9f5289 100644
  };
  
  void Indium::PrivateRenderCommandEncoder::setVertexSamplerStates(const std::vector<std::shared_ptr<SamplerState>>& states, Range<size_t> range) {
-@@ -411,28 +893,34 @@ void Indium::PrivateRenderCommandEncoder::setVertexSamplerStates(const std::vect
+@@ -411,28 +888,34 @@ void Indium::PrivateRenderCommandEncoder::setVertexSamplerStates(const std::vect
  	}
  };
  
@@ -5266,7 +5350,7 @@ index b27ffe5..c9f5289 100644
  	}
  };
  
-@@ -440,12 +928,14 @@ void Indium::PrivateRenderCommandEncoder::setFragmentBufferOffset(size_t offset,
+@@ -440,12 +923,14 @@ void Indium::PrivateRenderCommandEncoder::setFragmentBufferOffset(size_t offset,
  	_functionResources[1].setBufferOffset(offset, index);
  };
  
@@ -5283,7 +5367,7 @@ index b27ffe5..c9f5289 100644
  };
  
  void Indium::PrivateRenderCommandEncoder::setFragmentSamplerStates(const std::vector<std::shared_ptr<SamplerState>>& states, Range<size_t> range) {
-@@ -460,69 +950,102 @@ void Indium::PrivateRenderCommandEncoder::setFragmentSamplerStates(const std::ve
+@@ -460,69 +945,102 @@ void Indium::PrivateRenderCommandEncoder::setFragmentSamplerStates(const std::ve
  	}
  };
  
@@ -5317,17 +5401,17 @@ index b27ffe5..c9f5289 100644
  	switch (primitiveType) {
  		case PrimitiveType::Point:
 -			pipeline = _privatePSO->pipelines()[0];
-+			pipeline = _privatePSO->pipelineForTopologyIndex(0);
++			pipeline = _privatePSO->pipelineForTopologyIndex(0, _renderPass);
  			break;
  		case PrimitiveType::Line:
  		case PrimitiveType::LineStrip:
 -			pipeline = _privatePSO->pipelines()[1];
-+			pipeline = _privatePSO->pipelineForTopologyIndex(1);
++			pipeline = _privatePSO->pipelineForTopologyIndex(1, _renderPass);
  			break;
  		case PrimitiveType::Triangle:
  		case PrimitiveType::TriangleStrip:
 -			pipeline = _privatePSO->pipelines()[2];
-+			pipeline = _privatePSO->pipelineForTopologyIndex(2);
++			pipeline = _privatePSO->pipelineForTopologyIndex(2, _renderPass);
  			break;
  		default:
  			throw BadEnumValue();
@@ -5410,7 +5494,7 @@ index b27ffe5..c9f5289 100644
  	DynamicVK::vkCmdSetDepthWriteEnable(buf->commandBuffer(), desc.depthWriteEnabled ? VK_TRUE : VK_FALSE);
  	DynamicVK::vkCmdSetDepthCompareOp(buf->commandBuffer(), compareFunctionToVkCompareOp(desc.depthCompareFunction));
  	DynamicVK::vkCmdSetDepthTestEnable(buf->commandBuffer(), VK_TRUE);
-@@ -694,3 +1217,18 @@ void Indium::PrivateRenderCommandEncoder::useResources(const std::vector<std::sh
+@@ -694,3 +1212,18 @@ void Indium::PrivateRenderCommandEncoder::useResources(const std::vector<std::sh
  	// TODO: check what Metal does in this case. this is just an educated guess
  	useResources(resources, usage, RenderStages::Vertex | RenderStages::Fragment | RenderStages::Tile | RenderStages::Object | RenderStages::Mesh);
  };
@@ -5430,10 +5514,10 @@ index b27ffe5..c9f5289 100644
 +    DynamicVK::vkCmdPipelineBarrier(buf->commandBuffer(), stages, stages, VK_DEPENDENCY_BY_REGION_BIT, 1, &barrier, 0, nullptr, 0, nullptr);
 +}
 diff --git a/src/indium/render-pipeline.cpp b/src/indium/render-pipeline.cpp
-index 1b6bb3b..4674d2e 100644
+index 1b6bb3b..a2da6c1 100644
 --- a/src/indium/render-pipeline.cpp
 +++ b/src/indium/render-pipeline.cpp
-@@ -1,10 +1,19 @@
+@@ -1,10 +1,24 @@
 +#include <atomic>
 +#include <indium/black-trace.private.hpp>
 +#include <indium/slow-log.private.hpp>
@@ -5450,10 +5534,20 @@ index 1b6bb3b..4674d2e 100644
  
  #include <stdexcept>
 +#include <indium/vertex-input.private.hpp>
++
++#include <condition_variable>
++#include <cstdlib>
++#include <deque>
++#include <thread>
  
  Indium::RenderPipelineState::~RenderPipelineState() {};
  
-@@ -22,14 +31,121 @@ Indium::PrivateRenderPipelineState::PrivateRenderPipelineState(std::shared_ptr<P
+@@ -19,17 +33,131 @@ Indium::PrivateRenderPipelineState::PrivateRenderPipelineState(std::shared_ptr<P
+ 	_colorAttachments = descriptor.colorAttachments;
+ 	_vertexDescriptor = descriptor.vertexDescriptor;
+ 	_primitiveTopology = descriptor.inputPrimitiveTopology;
++	_depthPixelFormat = descriptor.depthAttachmentPixelFormat;
++	_stencilPixelFormat = descriptor.stencilAttachmentPixelFormat;
  
  	_vertexFunction = std::dynamic_pointer_cast<PrivateFunction>(descriptor.vertexFunction);
  	_fragmentFunction = std::dynamic_pointer_cast<PrivateFunction>(descriptor.fragmentFunction);
@@ -5574,34 +5668,60 @@ index 1b6bb3b..4674d2e 100644
  Indium::PrivateRenderPipelineState::~PrivateRenderPipelineState() {
 -	if (_pipelines[0]) {
 -		for (auto& pipeline: _pipelines) {
++	destroyPipelinesLocked();
++};
++
++void Indium::PrivateRenderPipelineState::destroyPipelinesLocked() {
++	_readyMask.store(0, std::memory_order_release);
 +	for (auto& pipeline: _pipelines) {
 +		if (pipeline) {
  			DynamicVK::vkDestroyPipeline(_privateDevice->device(), pipeline, nullptr);
  			pipeline = VK_NULL_HANDLE;
  		}
-@@ -42,13 +158,13 @@ Indium::PrivateRenderPipelineState::~PrivateRenderPipelineState() {
+@@ -39,34 +167,100 @@ Indium::PrivateRenderPipelineState::~PrivateRenderPipelineState() {
+ 		DynamicVK::vkDestroyPipelineLayout(_privateDevice->device(), _pipelineLayout, nullptr);
+ 		_pipelineLayout = VK_NULL_HANDLE;
+ 	}
++	_prewarmCompat.reset();
  };
  
- void Indium::PrivateRenderPipelineState::recreatePipeline(VkRenderPass compatibleRenderPass, bool force) {
+-void Indium::PrivateRenderPipelineState::recreatePipeline(VkRenderPass compatibleRenderPass, bool force) {
 -	if (!force && _pipelines[0]) {
-+	if (!force && ready()) {
++void Indium::PrivateRenderPipelineState::recreatePipeline(VkRenderPass compatibleRenderPass, const std::optional<RenderPassCompatKey>& compatibility, bool force) {
++	if (!force && _inUse.load(std::memory_order_acquire) && ready()) {
  		// assumes that the current pipeline is compatible with the given render pass
  		return;
  	}
- 
+-
 -	if (_pipelines[0]) {
 -		for (auto& pipeline: _pipelines) {
-+	for (auto& pipeline: _pipelines) {
-+		if (pipeline) {
- 			DynamicVK::vkDestroyPipeline(_privateDevice->device(), pipeline, nullptr);
- 			pipeline = VK_NULL_HANDLE;
+-			DynamicVK::vkDestroyPipeline(_privateDevice->device(), pipeline, nullptr);
+-			pipeline = VK_NULL_HANDLE;
++	std::unique_lock<std::mutex> lock(_pipelineMutex, std::defer_lock);
++	{
++		// A prewarm still compiling this state holds the lock; the first draw waits for it here.
++		SlowLog::Scope slowWait("waitPipelinePrewarm", this, nullptr, 0);
++		lock.lock();
++	}
++	if (!force && ready()) {
++		if (_inUse.load(std::memory_order_relaxed) || !_prewarmCompat || (compatibility && *compatibility == *_prewarmCompat)) {
++			_inUse.store(true, std::memory_order_release);
++			return;
  		}
-@@ -59,14 +175,64 @@ void Indium::PrivateRenderPipelineState::recreatePipeline(VkRenderPass compatibl
- 		_pipelineLayout = VK_NULL_HANDLE;
++		// Prewarmed against a pass this one is not compatible with. Nothing has bound these
++		// pipelines yet (_inUse is false), so they can go.
++		if (SlowLog::enabled()) SlowLog::write("pipelinePrewarmMismatch", 0.0, this, nullptr, 0);
  	}
  
-+	_compatibleRenderPass = compatibleRenderPass;
+-	if (_pipelineLayout) {
+-		DynamicVK::vkDestroyPipelineLayout(_privateDevice->device(), _pipelineLayout, nullptr);
+-		_pipelineLayout = VK_NULL_HANDLE;
++	destroyPipelinesLocked();
++	buildPrimaryLocked(compatibleRenderPass);
++	_inUse.store(true, std::memory_order_release);
++};
 +
++void Indium::PrivateRenderPipelineState::buildPrimaryLocked(VkRenderPass compatibleRenderPass) {
 +	std::vector<size_t> inputLocations;
 +	for (const auto& binding : _vertexFunction->functionInfo().bindings)
 +		if (binding.type == Iridium::BindingType::VertexInput) inputLocations.push_back(binding.index);
@@ -5630,17 +5750,25 @@ index 1b6bb3b..4674d2e 100644
 +	} else if (_primitiveTopology == PrimitiveTopologyClass::Line) {
 +		primaryIndex = 1;
 +	}
-+	pipelineForTopologyIndex(primaryIndex);
++	createTopologyLocked(primaryIndex, compatibleRenderPass);
 +};
 +
-+VkPipeline Indium::PrivateRenderPipelineState::pipelineForTopologyIndex(size_t index) {
++VkPipeline Indium::PrivateRenderPipelineState::pipelineForTopologyIndex(size_t index, VkRenderPass renderPass) {
 +	if (index >= _pipelines.size()) {
 +		abort();
 +	}
-+	if (_pipelines[index]) {
++	if (_readyMask.load(std::memory_order_acquire) & (1u << index)) {
 +		return _pipelines[index];
 +	}
++	std::lock_guard<std::mutex> lock(_pipelineMutex);
++	return createTopologyLocked(index, renderPass);
++};
 +
++VkPipeline Indium::PrivateRenderPipelineState::createTopologyLocked(size_t index, VkRenderPass renderPass) {
++	if (_pipelines[index]) {
++		return _pipelines[index];
+ 	}
+ 
  	auto vertexFunctionName = _vertexFunction->name();
  	auto fragmentFunctionName = _fragmentFunction->name();
 +	SlowLog::Scope slowCreate("createGraphicsPipelines", _vertexFunction->library().get(), _fragmentFunction->library().get(), index);
@@ -5661,7 +5789,7 @@ index 1b6bb3b..4674d2e 100644
  	shaderStage.module = _vertexFunction->library()->shaderModule();
  	shaderStage.pName = vertexFunctionName.c_str();
  	stages.push_back(shaderStage);
-@@ -82,51 +248,15 @@ void Indium::PrivateRenderPipelineState::recreatePipeline(VkRenderPass compatibl
+@@ -82,51 +276,15 @@ void Indium::PrivateRenderPipelineState::recreatePipeline(VkRenderPass compatibl
  	std::vector<VkVertexInputBindingDescription> vertexBindingDescs;
  	std::vector<VkVertexInputAttributeDescription> vertexAttrDescs;
  
@@ -5718,11 +5846,11 @@ index 1b6bb3b..4674d2e 100644
 +    const auto plan = vertexInputPlan(_vertexDescriptor.value_or(VertexDescriptor{}), inputLocations);
 +    vertexBindingDescs = plan.bindings;
 +    vertexAttrDescs = plan.attributes;
-+    _vertexInputBindings = plan.metalBindings;
++    // _vertexInputBindings was set from the same plan by buildPrimaryLocked; draws read it unlocked.
  
  	vertexInputState.vertexBindingDescriptionCount = vertexBindingDescs.size();
  	vertexInputState.pVertexBindingDescriptions = vertexBindingDescs.data();
-@@ -135,6 +265,8 @@ void Indium::PrivateRenderPipelineState::recreatePipeline(VkRenderPass compatibl
+@@ -135,6 +293,8 @@ void Indium::PrivateRenderPipelineState::recreatePipeline(VkRenderPass compatibl
  
  	VkPipelineInputAssemblyStateCreateInfo inputAssemblyState {};
  	inputAssemblyState.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
@@ -5731,7 +5859,7 @@ index 1b6bb3b..4674d2e 100644
  
  	VkPipelineTessellationStateCreateInfo tesselationState {};
  	tesselationState.sType = VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO;
-@@ -144,8 +276,6 @@ void Indium::PrivateRenderPipelineState::recreatePipeline(VkRenderPass compatibl
+@@ -144,8 +304,6 @@ void Indium::PrivateRenderPipelineState::recreatePipeline(VkRenderPass compatibl
  
  	VkPipelineRasterizationStateCreateInfo rasterizationState {};
  	rasterizationState.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
@@ -5740,7 +5868,7 @@ index 1b6bb3b..4674d2e 100644
  	rasterizationState.polygonMode = VK_POLYGON_MODE_FILL;
  	rasterizationState.lineWidth = 1.0f;
  
-@@ -168,6 +298,7 @@ void Indium::PrivateRenderPipelineState::recreatePipeline(VkRenderPass compatibl
+@@ -168,6 +326,7 @@ void Indium::PrivateRenderPipelineState::recreatePipeline(VkRenderPass compatibl
  		tmp.dstAlphaBlendFactor = blendFactorToVkBlendFactor(colorInfo.destinationAlphaBlendFactor);
  		tmp.alphaBlendOp = blendOperationToVkBlendOp(colorInfo.alphaBlendOperation);
  		tmp.colorWriteMask = colorWriteMaskToVkColorComponentFlags(colorInfo.writeMask);
@@ -5748,7 +5876,7 @@ index 1b6bb3b..4674d2e 100644
  		colorBlendStates.push_back(tmp);
  	}
  	VkPipelineColorBlendStateCreateInfo colorBlendState {};
-@@ -204,20 +335,6 @@ void Indium::PrivateRenderPipelineState::recreatePipeline(VkRenderPass compatibl
+@@ -204,20 +363,6 @@ void Indium::PrivateRenderPipelineState::recreatePipeline(VkRenderPass compatibl
  	dynamicState.dynamicStateCount = dynamicStates.size();
  	dynamicState.pDynamicStates = dynamicStates.data();
  
@@ -5769,12 +5897,13 @@ index 1b6bb3b..4674d2e 100644
  	VkGraphicsPipelineCreateInfo pipelineCreateInfo {};
  	pipelineCreateInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
  	pipelineCreateInfo.stageCount = stages.size();
-@@ -232,32 +349,14 @@ void Indium::PrivateRenderPipelineState::recreatePipeline(VkRenderPass compatibl
+@@ -232,32 +377,154 @@ void Indium::PrivateRenderPipelineState::recreatePipeline(VkRenderPass compatibl
  	pipelineCreateInfo.pColorBlendState = &colorBlendState;
  	pipelineCreateInfo.pDynamicState = &dynamicState;
  	pipelineCreateInfo.layout = _pipelineLayout;
 -	pipelineCreateInfo.renderPass = compatibleRenderPass;
--
++	pipelineCreateInfo.renderPass = renderPass;
+ 
 -	// we can set the primitive topology dynamically, but unfortunately, we can only set it for a different topology
 -	// in the same topology class that the pipeline was created for. this means we need to create 3 pipelines
 -	// (one for each topology class) rather than 5 (one for each primitive topology).
@@ -5782,27 +5911,162 @@ index 1b6bb3b..4674d2e 100644
 -	// first, one for points
 -	inputAssemblyState.topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
 -	if (DynamicVK::vkCreateGraphicsPipelines(_privateDevice->device(), VK_NULL_HANDLE, 1, &pipelineCreateInfo, nullptr, &_pipelines[0]) != VK_SUCCESS) {
--		// TODO
--		abort();
--	}
--
++	if (DynamicVK::vkCreateGraphicsPipelines(_privateDevice->device(), _privateDevice->pipelineCache(), 1, &pipelineCreateInfo, nullptr, &_pipelines[index]) != VK_SUCCESS) {
+ 		// TODO
+ 		abort();
+ 	}
++	_readyMask.fetch_or(static_cast<uint8_t>(1u << index), std::memory_order_release);
++	_privateDevice->notePipelineCreated();
++	return _pipelines[index];
++};
+ 
 -	// now, one for lines
 -	inputAssemblyState.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
 -	if (DynamicVK::vkCreateGraphicsPipelines(_privateDevice->device(), VK_NULL_HANDLE, 1, &pipelineCreateInfo, nullptr, &_pipelines[1]) != VK_SUCCESS) {
 -		// TODO
 -		abort();
--	}
-+	pipelineCreateInfo.renderPass = _compatibleRenderPass;
++namespace {
++	bool asyncPipelinesEnabled() {
++		static const bool enabled = [] {
++			if (access("/tmp/metal-async-pipelines", F_OK) == 0) return true;
++			const char* env = getenv("INDIUM_ASYNC_PIPELINES");
++			return env && env[0] == '1';
++		}();
++		return enabled;
+ 	}
  
 -	// finally, one for triangles
 -	inputAssemblyState.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 -	if (DynamicVK::vkCreateGraphicsPipelines(_privateDevice->device(), VK_NULL_HANDLE, 1, &pipelineCreateInfo, nullptr, &_pipelines[2]) != VK_SUCCESS) {
-+	if (DynamicVK::vkCreateGraphicsPipelines(_privateDevice->device(), _privateDevice->pipelineCache(), 1, &pipelineCreateInfo, nullptr, &_pipelines[index]) != VK_SUCCESS) {
- 		// TODO
- 		abort();
+-		// TODO
+-		abort();
++	// Process-wide prewarm queue. Jobs hold weak references: a state released before its turn is
++	// skipped, and a running job keeps its state (and through it the device) alive. Never destroyed,
++	// like the other process-lifetime Indium state, so the detached workers cannot outlive it.
++	struct PrewarmQueue {
++		std::mutex mutex;
++		std::condition_variable cv;
++		std::deque<std::weak_ptr<Indium::PrivateRenderPipelineState>> jobs;
++		bool started = false;
++	};
++
++	PrewarmQueue& prewarmQueue() {
++		static auto* queue = new PrewarmQueue();
++		return *queue;
++	}
++
++	void prewarmLoop() {
++		auto& queue = prewarmQueue();
++		for (;;) {
++			std::weak_ptr<Indium::PrivateRenderPipelineState> job;
++			{
++				std::unique_lock<std::mutex> lock(queue.mutex);
++				queue.cv.wait(lock, [&] { return !queue.jobs.empty(); });
++				job = std::move(queue.jobs.front());
++				queue.jobs.pop_front();
++			}
++			if (auto state = job.lock()) {
++				try {
++					state->prewarm();
++				} catch (...) {
++					// Leave the state unbuilt: its first use builds it and reports the error there.
++				}
++			}
++		}
++	}
++}
++
++void Indium::PrivateRenderPipelineState::schedulePrewarm(const std::shared_ptr<PrivateRenderPipelineState>& state) {
++	if (!state || !asyncPipelinesEnabled()) return;
++	auto& queue = prewarmQueue();
++	{
++		std::lock_guard<std::mutex> lock(queue.mutex);
++		queue.jobs.push_back(state);
++		if (!queue.started) {
++			queue.started = true;
++			// Two workers: enough to drain a loading-screen burst ahead of the first draws without
++			// competing much with the game's own threads.
++			for (int i = 0; i < 2; ++i) std::thread(prewarmLoop).detach();
++		}
++	}
++	queue.cv.notify_one();
++};
++
++void Indium::PrivateRenderPipelineState::prewarm() {
++	if (!_vertexFunction || !_fragmentFunction || ready()) return;
++
++	// The pass a render encoder builds for attachments of these formats (see the
++	// PrivateRenderCommandEncoder constructor): used colour slots in order, then depth/stencil.
++	// Load/store operations and layouts do not affect compatibility.
++	std::vector<VkAttachmentDescription> attachments;
++	std::vector<VkAttachmentReference> colorReferences;
++	for (const auto& color: _colorAttachments) {
++		VkAttachmentReference reference {};
++		reference.attachment = VK_ATTACHMENT_UNUSED;
++		reference.layout = VK_IMAGE_LAYOUT_GENERAL;
++		if (color.pixelFormat != PixelFormat::Invalid) {
++			VkAttachmentDescription description {};
++			description.format = pixelFormatToVkFormat(color.pixelFormat);
++			description.samples = VK_SAMPLE_COUNT_1_BIT;
++			description.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
++			description.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++			description.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
++			description.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
++			description.initialLayout = description.finalLayout = VK_IMAGE_LAYOUT_GENERAL;
++			reference.attachment = static_cast<uint32_t>(attachments.size());
++			attachments.push_back(description);
++		}
++		colorReferences.push_back(reference);
++	}
++	VkAttachmentReference depthReference {};
++	const PixelFormat depthFormat = _depthPixelFormat != PixelFormat::Invalid ? _depthPixelFormat : _stencilPixelFormat;
++	if (depthFormat != PixelFormat::Invalid) {
++		VkAttachmentDescription description {};
++		description.format = pixelFormatToVkFormat(depthFormat);
++		description.samples = VK_SAMPLE_COUNT_1_BIT;
++		description.loadOp = description.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
++		description.storeOp = description.stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
++		description.initialLayout = description.finalLayout = VK_IMAGE_LAYOUT_GENERAL;
++		depthReference.attachment = static_cast<uint32_t>(attachments.size());
++		depthReference.layout = VK_IMAGE_LAYOUT_GENERAL;
++		attachments.push_back(description);
++	}
++	if (attachments.empty()) return;
++
++	const VkSubpassDependency dependency = encoderSubpassDependency();
++	VkSubpassDescription subpass {};
++	subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
++	subpass.colorAttachmentCount = static_cast<uint32_t>(colorReferences.size());
++	subpass.pColorAttachments = colorReferences.data();
++	subpass.pDepthStencilAttachment = depthFormat != PixelFormat::Invalid ? &depthReference : nullptr;
++
++	VkRenderPassCreateInfo info {};
++	info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
++	info.attachmentCount = static_cast<uint32_t>(attachments.size());
++	info.pAttachments = attachments.data();
++	info.subpassCount = 1;
++	info.pSubpasses = &subpass;
++	info.dependencyCount = 1;
++	info.pDependencies = &dependency;
++
++	auto compatibility = renderPassCompatKey(info);
++	if (!compatibility) return;
++	// Device-owned, so it stays valid while this state lives; null once the device's bounded set
++	// of prewarm passes is full.
++	VkRenderPass renderPass = _privateDevice->acquirePrewarmRenderPass(info);
++	if (!renderPass) return;
++
++	std::lock_guard<std::mutex> lock(_pipelineMutex);
++	// An encoder got here first and built (or is using) its own pipelines.
++	if (_inUse.load(std::memory_order_relaxed) || ready()) return;
++	SlowLog::Scope slowPrewarm("prewarmGraphicsPipeline", this, nullptr, 0);
++	try {
++		buildPrimaryLocked(renderPass);
++	} catch (...) {
++		destroyPipelinesLocked();
++		throw;
  	}
-+	_privateDevice->notePipelineCreated();
-+	return _pipelines[index];
++	_prewarmCompat = std::move(compatibility);
  };
  
  const Indium::FunctionInfo& Indium::PrivateRenderPipelineState::vertexFunctionInfo() {
@@ -8979,14 +9243,16 @@ new file mode 100644
 +}
 diff --git a/private-include/indium/render-pass-key.private.hpp b/private-include/indium/render-pass-key.private.hpp
 new file mode 100644
+index 0000000..8db0f66
 --- /dev/null
 +++ b/private-include/indium/render-pass-key.private.hpp
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,107 @@
 +#pragma once
 +#include <vulkan/vulkan.h>
 +#include <array>
 +#include <algorithm>
 +#include <optional>
++#include <vector>
 +
 +namespace Indium {
 +// Exact descriptions, rather than Vulkan compatibility, determine reuse: load
@@ -9034,6 +9300,56 @@ new file mode 100644
 +        const auto& d = info.pDependencies[i];
 +        add(d.srcSubpass); add(d.dstSubpass); add(d.srcStageMask); add(d.dstStageMask);
 +        add(d.srcAccessMask); add(d.dstAccessMask); add(d.dependencyFlags);
++    }
++    return key;
++}
++
++// The single self-dependency every render encoder pass carries (League uses
++// fragment-to-fragment barriers for texture/render-target scope). Shared with
++// the passes pipelines are prewarmed against, which must stay compatible.
++inline VkSubpassDependency encoderSubpassDependency() {
++    VkSubpassDependency dependency {};
++    dependency.srcSubpass = dependency.dstSubpass = 0;
++    dependency.srcStageMask = dependency.dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
++    dependency.srcAccessMask = dependency.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
++        VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
++    dependency.dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
++    return dependency;
++}
++
++// Vulkan render pass compatibility: two passes with equal keys are compatible.
++// Everything is compared except what compatibility ignores (load/store ops and
++// image layouts); missing trailing colour references count as UNUSED. Unusual
++// structures yield no key and are never treated as compatible.
++using RenderPassCompatKey = std::vector<uint32_t>;
++inline std::optional<RenderPassCompatKey> renderPassCompatKey(const VkRenderPassCreateInfo& info) {
++    if (info.pNext || info.subpassCount != 1) return std::nullopt;
++    const auto& subpass = info.pSubpasses[0];
++    if (subpass.inputAttachmentCount || subpass.pResolveAttachments || subpass.preserveAttachmentCount)
++        return std::nullopt;
++    RenderPassCompatKey key;
++    key.push_back(info.flags); key.push_back(info.attachmentCount);
++    for (uint32_t i = 0; i < info.attachmentCount; ++i) {
++        const auto& a = info.pAttachments[i];
++        key.push_back(a.flags); key.push_back(a.format); key.push_back(a.samples);
++    }
++    key.push_back(subpass.flags); key.push_back(subpass.pipelineBindPoint);
++    uint32_t colorCount = subpass.colorAttachmentCount;
++    while (colorCount && subpass.pColorAttachments[colorCount - 1].attachment == VK_ATTACHMENT_UNUSED) --colorCount;
++    key.push_back(colorCount);
++    for (uint32_t i = 0; i < colorCount; ++i) {
++        const uint32_t attachment = subpass.pColorAttachments[i].attachment;
++        if (attachment != VK_ATTACHMENT_UNUSED && attachment >= info.attachmentCount) return std::nullopt;
++        key.push_back(attachment);
++    }
++    const uint32_t depth = subpass.pDepthStencilAttachment ? subpass.pDepthStencilAttachment->attachment : VK_ATTACHMENT_UNUSED;
++    if (depth != VK_ATTACHMENT_UNUSED && depth >= info.attachmentCount) return std::nullopt;
++    key.push_back(depth);
++    key.push_back(info.dependencyCount);
++    for (uint32_t i = 0; i < info.dependencyCount; ++i) {
++        const auto& d = info.pDependencies[i];
++        key.push_back(d.srcSubpass); key.push_back(d.dstSubpass); key.push_back(d.srcStageMask); key.push_back(d.dstStageMask);
++        key.push_back(d.srcAccessMask); key.push_back(d.dstAccessMask); key.push_back(d.dependencyFlags);
 +    }
 +    return key;
 +}
@@ -9995,10 +10311,23 @@ index 0000000..962fdad
 +}
 +}
 diff --git a/private-include/indium/render-pipeline.private.hpp b/private-include/indium/render-pipeline.private.hpp
-index 7e5f242..7a4ad51 100644
+index 7e5f242..7ca2bcc 100644
 --- a/private-include/indium/render-pipeline.private.hpp
 +++ b/private-include/indium/render-pipeline.private.hpp
-@@ -22,6 +22,9 @@ namespace Indium {
+@@ -5,7 +5,12 @@
+ 
+ #include <vulkan/vulkan.h>
+ 
++#include <indium/render-pass-key.private.hpp>
++
+ #include <array>
++#include <atomic>
++#include <memory>
++#include <mutex>
+ #include <optional>
+ 
+ namespace Indium {
+@@ -22,6 +27,9 @@ namespace Indium {
  			std::optional<VertexDescriptor> _vertexDescriptor;
  
  		public:
@@ -10008,14 +10337,27 @@ index 7e5f242..7a4ad51 100644
  			PrivateRenderPipelineState(std::shared_ptr<PrivateDevice> device, const RenderPipelineDescriptor& descriptor);
  			~PrivateRenderPipelineState();
  
-@@ -37,9 +40,17 @@ namespace Indium {
+@@ -36,10 +44,29 @@ namespace Indium {
+ 			//       (which does not include e.g. load and store ops).
  			//       if so, we would always be able to create the pipeline immediately
  			//       in the constructor.
- 			void recreatePipeline(VkRenderPass compatibleRenderPass, bool force);
-+			VkPipeline pipelineForTopologyIndex(size_t index);
+-			void recreatePipeline(VkRenderPass compatibleRenderPass, bool force);
++			//
++			// compatibility is the signature of compatibleRenderPass; a pipeline prewarmed against another
++			// pass is rebuilt on its first use unless the two passes are compatible.
++			void recreatePipeline(VkRenderPass compatibleRenderPass, const std::optional<RenderPassCompatKey>& compatibility, bool force);
++			// renderPass is the pass the pipeline is about to be used in (only read when the topology
++			// variant does not exist yet).
++			VkPipeline pipelineForTopologyIndex(size_t index, VkRenderPass renderPass);
++
++			// Opt-in (guest file /tmp/metal-async-pipelines or INDIUM_ASYNC_PIPELINES=1): compile the
++			// primary-topology pipeline on a background thread against a pass built from the descriptor's
++			// formats, so the first draw finds it ready. Without the switch this does nothing.
++			static void schedulePrewarm(const std::shared_ptr<PrivateRenderPipelineState>& state);
++			void prewarm();
 +
 +            bool ready() const {
-+                return _pipelineLayout && (_pipelines[0] || _pipelines[1] || _pipelines[2]);
++                return _readyMask.load(std::memory_order_acquire) != 0;
 +            }
  
  			const FunctionInfo& vertexFunctionInfo();
@@ -10026,12 +10368,27 @@ index 7e5f242..7a4ad51 100644
  
  			INDIUM_PROPERTY_READONLY_OBJECT(PrivateDevice, p, P,rivateDevice);
  
-@@ -51,5 +62,7 @@ namespace Indium {
+@@ -51,5 +78,22 @@ namespace Indium {
  			INDIUM_PROPERTY_REF(DescriptorSetLayouts<2>, d, D,escriptorSetLayouts);
  
  			INDIUM_PROPERTY_READONLY_REF(std::vector<size_t>, v,V,ertexInputBindings);
 +		private:
-+			VkRenderPass _compatibleRenderPass = VK_NULL_HANDLE;
++			void destroyPipelinesLocked();
++			void buildPrimaryLocked(VkRenderPass renderPass);
++			VkPipeline createTopologyLocked(size_t index, VkRenderPass renderPass);
++
++			PixelFormat _depthPixelFormat = PixelFormat::Invalid;
++			PixelFormat _stencilPixelFormat = PixelFormat::Invalid;
++			// Guards pipeline creation and destruction; _readyMask (bit per topology index) is published
++			// with release ordering after the matching _pipelines entry is written, so draws can read
++			// existing pipelines without the lock.
++			std::mutex _pipelineMutex;
++			std::atomic<uint8_t> _readyMask {0};
++			// Set once an encoder has selected this state; from then on its pipelines may be bound
++			// and are never replaced.
++			std::atomic<bool> _inUse {false};
++			// Signature of the synthesized pass the current pipelines were prewarmed against.
++			std::optional<RenderPassCompatKey> _prewarmCompat;
  	};
  };
 diff --git a/private-include/indium/vertex-input.private.hpp b/private-include/indium/vertex-input.private.hpp
