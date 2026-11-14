@@ -196,6 +196,35 @@ Darling.
   when `Finished Main Loop` / `GAMESTATE_EXIT` is entered so the user does not
   see a frozen screen during the disconnect handshake.
 
+## 17. Arena game mode severe frame pacing hitches (observed)
+
+- **Symptom:** Playing the Arena game mode (2v2v2v2) results in recurrent and
+  pronounced frame hitching and micro-stutters across the entire duration of the
+  match, unlike Summoner's Rift or ARAM which stabilize after the first minutes.
+- **Data from live log (`2026-11-13T20-31-23_r3dlog.txt`):**
+  - Average FPS: 94.89 fps (Average Frame Time: 10.54 ms).
+  - Maximum Frame Time: 1029.67 ms (a full 1.03-second freeze at `000677.727`).
+  - Frame time histogram showed over 9,500 frames spiking above 18 ms (>55ms
+    frametime drops), with 2,065 frames dropping below 30 FPS.
+  - Network logs confirmed 0 packet loss and stable 38 ms ping, verifying the
+    stutters are purely client-side rendering bottlenecks.
+- **Root cause:**
+  1. *Continuous dynamic Augment selection:* Unlike 5v5 where base champion kits
+     remain fixed, each Arena round grants players new Prismatic, Gold, or Silver
+     augments (e.g., `Augment_PinballSnowball`). Each augment dynamically binds
+     new spell effects, projectiles, and particle shaders in combat.
+  2. *Sub-arena rotation:* Every round teleports players between different
+     sub-maps (Ancestral Woods, Koi Pond, Magma Chamber) with different terrain
+     and water surface shaders.
+  3. *Guest hazard cameos:* Dynamic hazard champions (Sett, Pyke, Jhin) introduce
+     additional arena-specific shaders.
+  4. *Triple pipeline compilation overhead:* In `indium/render-pipeline.cpp`,
+     every new pipeline compiles 3 separate Vulkan pipelines (Point List, Line
+     List, Triangle List) synchronously with `VK_NULL_HANDLE`, amplifying every
+     hitch threefold on the render thread.
+- **Fix:** Implementing disk-backed `VkPipelineCache` (PR F) will eliminate these
+  recurring hitches across rounds and matches.
+
 ---
 
 ## Pull request plan
