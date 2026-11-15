@@ -117,7 +117,7 @@ index d17993c..0458265 100644
  	};
  };
 diff --git a/include/iridium/iridium.hpp b/include/iridium/iridium.hpp
-index 900d03a..ae5eff1 100644
+index 900d03a..611b287 100644
 --- a/include/iridium/iridium.hpp
 +++ b/include/iridium/iridium.hpp
 @@ -1,6 +1,7 @@
@@ -128,7 +128,23 @@ index 900d03a..ae5eff1 100644
  
  #include <vector>
  #include <unordered_map>
-@@ -90,9 +91,25 @@ namespace Iridium {
+@@ -10,6 +11,15 @@ namespace Iridium {
+ 	bool init();
+ 	void finit();
+ 
++	/**
++	 * Names the translator behind `translate`: a hash of the Iridium sources this library was built from,
++	 * and the version of the LLVM library it loaded. Output of `translate` that was stored under one
++	 * identity must not be reused under another.
++	 *
++	 * @returns An empty string unless `init` has succeeded; nothing may be stored or reused then.
++	 */
++	std::string translatorIdentity();
++
+ 	enum class FunctionType {
+ 		Vertex = 1,
+ 		Fragment = 2,
+@@ -90,9 +100,25 @@ namespace Iridium {
  		float lodMax;
  	};
  
@@ -818,19 +834,20 @@ index 8546daa..5d2e98d 100644
  		void updateBindings();
  
 diff --git a/private-include/indium/device.private.hpp b/private-include/indium/device.private.hpp
-index 58f1794..a552dfb 100644
+index 58f1794..ae3de73 100644
 --- a/private-include/indium/device.private.hpp
 +++ b/private-include/indium/device.private.hpp
-@@ -13,6 +13,8 @@
+@@ -13,6 +13,9 @@
  #include <functional>
  #include <atomic>
  #include <optional>
++#include <string>
 +#include <unordered_map>
 +#include <indium/render-pass-key.private.hpp>
  
  namespace Indium {
  	class PrivateDevice;
-@@ -25,8 +27,11 @@ namespace Indium {
+@@ -25,8 +28,11 @@ namespace Indium {
  	class PrivateDevice: public Device, public std::enable_shared_from_this<PrivateDevice> {
  	private:
  
@@ -842,7 +859,7 @@ index 58f1794..a552dfb 100644
  
  		// these are stored separately (rather than in a single structure)
  		// so that we can easily copy them individually in the event loop polling function.
-@@ -59,6 +64,8 @@ namespace Indium {
+@@ -59,6 +65,8 @@ namespace Indium {
  		}
  
  		virtual std::string name() const override;
@@ -851,7 +868,7 @@ index 58f1794..a552dfb 100644
  		virtual std::shared_ptr<CommandQueue> newCommandQueue() override;
  		virtual std::shared_ptr<RenderPipelineState> newRenderPipelineState(const RenderPipelineDescriptor& descriptor) override;
  		virtual std::shared_ptr<ComputePipelineState> newComputePipelineState(const ComputePipelineDescriptor& descriptor, PipelineOption options, std::shared_ptr<ComputePipelineReflection> reflection) override;
-@@ -73,6 +80,13 @@ namespace Indium {
+@@ -73,6 +81,13 @@ namespace Indium {
  		virtual void pollEvents(uint64_t timeoutNanoseconds) override;
  		virtual void wakeupEventLoop() override;
  
@@ -865,7 +882,7 @@ index 58f1794..a552dfb 100644
  		void waitForSemaphore(VkSemaphore semaphore, uint64_t targetValue, std::function<void()> callback);
  
  		/**
-@@ -86,6 +100,11 @@ namespace Indium {
+@@ -86,6 +101,11 @@ namespace Indium {
  		 * Similar to getTimelineSemaphore(), but wraps it in a shared pointer
  		 * that automatically releases the semaphore when all references to it die out.
  		 */
@@ -877,7 +894,7 @@ index 58f1794..a552dfb 100644
  		std::shared_ptr<TimelineSemaphore> getWrappedTimelineSemaphore();
  
  		BinarySemaphore getBinarySemaphore(bool exportable = false);
-@@ -111,5 +130,44 @@ namespace Indium {
+@@ -111,5 +131,49 @@ namespace Indium {
  
  		INDIUM_PROPERTY(VkPhysicalDeviceMemoryProperties, m, M,emoryProperties);
  		INDIUM_PROPERTY_READONLY(Feature, f, F,eatures);
@@ -920,6 +937,11 @@ index 58f1794..a552dfb 100644
 +	private:
 +		void initPipelineCache();
 +		VkPipelineCache _pipelineCache = VK_NULL_HANDLE;
++		// Each device saves its own cache to its own file: with /tmp/metal-all-devices there is more than one.
++		std::mutex _pipelineCacheMutex;
++		std::string _pipelineCachePath;
++		std::atomic<uint32_t> _pipelineCacheUnsaved {0};
++		std::atomic<uint64_t> _pipelineCacheLastSaveNs {0};
  	};
  };
 diff --git a/private-include/indium/dynamic-vk.hpp b/private-include/indium/dynamic-vk.hpp
@@ -1491,10 +1513,10 @@ index d49b5f4..45bbd42 100644
  			case VertexFormat::UChar:                 return VK_FORMAT_R8_UINT;
  			case VertexFormat::Char:                  return VK_FORMAT_R8_SINT;
 diff --git a/private-include/iridium/dynamic-llvm.hpp b/private-include/iridium/dynamic-llvm.hpp
-index b3756ef..dff6d29 100644
+index b3756ef..f6d648f 100644
 --- a/private-include/iridium/dynamic-llvm.hpp
 +++ b/private-include/iridium/dynamic-llvm.hpp
-@@ -2,10 +2,14 @@
+@@ -2,16 +2,23 @@
  
  #include <llvm-c/BitReader.h>
  #include <llvm-c/Core.h>
@@ -1509,7 +1531,16 @@ index b3756ef..dff6d29 100644
  
  namespace Iridium {
  	namespace DynamicLLVM {
-@@ -58,6 +62,9 @@ namespace Iridium {
+ 		bool init();
+ 		void finit();
+ 
++		// "major.minor.patch" of the LLVM library that init() loaded; empty when none is loaded.
++		const std::string& loadedVersion();
++
+ 		void* resolveSymbol(const char* name);
+ 
+ 		struct DynamicFunctionBase {
+@@ -58,6 +65,9 @@ namespace Iridium {
  		};
  
  		#define IRIDIUM_DYNAMICLLVM_FUNCTION_FOREACH(_macro) \
@@ -1519,7 +1550,7 @@ index b3756ef..dff6d29 100644
  			_macro(LLVMBasicBlockAsValue) \
  			_macro(LLVMConstIntGetSExtValue) \
  			_macro(LLVMConstIntGetZExtValue) \
-@@ -68,6 +75,15 @@ namespace Iridium {
+@@ -68,6 +78,15 @@ namespace Iridium {
  			_macro(LLVMCreateMemoryBufferWithMemoryRange) \
  			_macro(LLVMDisposeMemoryBuffer) \
  			_macro(LLVMDisposeMessage) \
@@ -1535,7 +1566,7 @@ index b3756ef..dff6d29 100644
  			_macro(LLVMDisposeModule) \
  			_macro(LLVMGetAlignment) \
  			_macro(LLVMGetArrayLength) \
-@@ -77,6 +93,11 @@ namespace Iridium {
+@@ -77,6 +96,11 @@ namespace Iridium {
  			_macro(LLVMGetElementAsConstant) \
  			_macro(LLVMGetElementType) \
  			_macro(LLVMGetFCmpPredicate) \
@@ -1547,7 +1578,7 @@ index b3756ef..dff6d29 100644
  			_macro(LLVMGetFirstBasicBlock) \
  			_macro(LLVMGetFirstInstruction) \
  			_macro(LLVMGetFirstNamedMetadata) \
-@@ -84,6 +105,7 @@ namespace Iridium {
+@@ -84,6 +108,7 @@ namespace Iridium {
  			_macro(LLVMGetIncomingValue) \
  			_macro(LLVMGetIndices) \
  			_macro(LLVMGetInitializer) \
@@ -1555,7 +1586,7 @@ index b3756ef..dff6d29 100644
  			_macro(LLVMGetInstructionOpcode) \
  			_macro(LLVMGetIntTypeWidth) \
  			_macro(LLVMGetLastInstruction) \
-@@ -107,6 +129,7 @@ namespace Iridium {
+@@ -107,6 +132,7 @@ namespace Iridium {
  			_macro(LLVMGetPointerAddressSpace) \
  			_macro(LLVMGetReturnType) \
  			_macro(LLVMGetSuccessor) \
@@ -2990,7 +3021,7 @@ index 5f62ad0..a2906f3 100644
  	DynamicVK::vkCmdBindDescriptorSets(buf->commandBuffer(), VK_PIPELINE_BIND_POINT_COMPUTE, _pso->layout(), 0, descriptorSets.size(), descriptorSets.data(), 0, nullptr);
  };
 diff --git a/src/indium/device.cpp b/src/indium/device.cpp
-index 322e186..4db08bf 100644
+index 322e186..a121e9f 100644
 --- a/src/indium/device.cpp
 +++ b/src/indium/device.cpp
 @@ -1,4 +1,10 @@
@@ -3004,7 +3035,7 @@ index 322e186..4db08bf 100644
  #include <indium/instance.private.hpp>
  #include <indium/command-queue.private.hpp>
  #include <indium/render-pipeline.private.hpp>
-@@ -12,39 +18,211 @@
+@@ -12,39 +18,212 @@
  
  #include <iridium/iridium.hpp>
  
@@ -3019,6 +3050,7 @@ index 322e186..4db08bf 100644
 +#include <cstdio>
 +#include <cstdlib>
  #include <cstring>
++#include <dirent.h>
 +#include <string>
 +#include <sys/stat.h>
 +#include <unistd.h>
@@ -3222,7 +3254,7 @@ index 322e186..4db08bf 100644
  			continue;
  		}
  
-@@ -67,12 +245,105 @@ void Indium::initGlobalDeviceList() {
+@@ -67,12 +246,105 @@ void Indium::initGlobalDeviceList() {
  		DynamicVK::vkGetPhysicalDeviceFeatures2(device, &features);
  
  		if (!features12.timelineSemaphore) {
@@ -3330,7 +3362,7 @@ index 322e186..4db08bf 100644
  };
  
  void Indium::finitGlobalDeviceList() {
-@@ -83,8 +354,16 @@ Indium::Device::~Device() {};
+@@ -83,8 +355,16 @@ Indium::Device::~Device() {};
  
  Indium::PrivateDevice::PrivateDevice(VkPhysicalDevice physicalDevice):
  	_physicalDevice(physicalDevice)
@@ -3348,7 +3380,7 @@ index 322e186..4db08bf 100644
  
  	std::vector<VkQueueFamilyProperties> queueFamilies;
  	uint32_t count = 0;
-@@ -233,6 +512,36 @@ Indium::PrivateDevice::PrivateDevice(VkPhysicalDevice physicalDevice):
+@@ -233,6 +513,36 @@ Indium::PrivateDevice::PrivateDevice(VkPhysicalDevice physicalDevice):
  		}
  	}
  
@@ -3385,7 +3417,7 @@ index 322e186..4db08bf 100644
  	VkDeviceCreateInfo deviceCreateInfo {};
  	deviceCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
  	deviceCreateInfo.pQueueCreateInfos = queueCreateInfos.data();
-@@ -246,6 +555,7 @@ Indium::PrivateDevice::PrivateDevice(VkPhysicalDevice physicalDevice):
+@@ -246,6 +556,7 @@ Indium::PrivateDevice::PrivateDevice(VkPhysicalDevice physicalDevice):
  	}
  
  	_features = indiumFeatures;
@@ -3393,7 +3425,7 @@ index 322e186..4db08bf 100644
  
  	for (const auto& index: queueFamilyIndices) {
  		VkQueue queue;
-@@ -294,9 +604,380 @@ Indium::PrivateDevice::PrivateDevice(VkPhysicalDevice physicalDevice):
+@@ -294,9 +605,434 @@ Indium::PrivateDevice::PrivateDevice(VkPhysicalDevice physicalDevice):
  			abort();
  		}
  	}
@@ -3423,18 +3455,6 @@ index 322e186..4db08bf 100644
 +		std::string tmpDir = "/tmp/indium-cache";
 +		mkdir(tmpDir.c_str(), 0777);
 +		return tmpDir;
-+	}
-+
-+	struct PipelineCacheState {
-+		std::mutex mutex;
-+		std::string path;
-+		std::atomic<uint32_t> unsaved {0};
-+		std::atomic<uint64_t> lastSaveNs {0};
-+	};
-+
-+	PipelineCacheState& pipelineCacheState() {
-+		static auto* state = new PipelineCacheState();
-+		return *state;
 +	}
 +
 +	uint64_t monotonicNs() {
@@ -3488,15 +3508,51 @@ index 322e186..4db08bf 100644
 +		return *map;
 +	}
 +
-+	constexpr char kIridiumCacheMagic[8] = {'I', 'R', 'D', 'C', 3, 0, 0, 0};
++	constexpr char kIridiumCacheMagic[8] = {'I', 'R', 'D', 'C', 4, 0, 0, 0};
 +
-+	std::string iridiumCacheFilePath(const std::string& dir, const LibraryCacheKey& key) {
-+		char name[128];
-+		snprintf(name, sizeof(name), "/iridium-v3-%016llx-%016llx-%zx.bin",
++	uint64_t fnv1a64(const void* data, size_t length) {
++		const auto* bytes = static_cast<const uint8_t*>(data);
++		uint64_t hash = 14695981039346656037ULL;
++		for (size_t i = 0; i < length; ++i) {
++			hash ^= bytes[i];
++			hash *= 1099511628211ULL;
++		}
++		return hash;
++	}
++
++	// A translation is only valid for the translator that made it. `identity` is Iridium::translatorIdentity():
++	// it changes with the Iridium sources and with the LLVM loaded at run time. It is part of every file name,
++	// so entries from another translator are never opened, and it is repeated in full in the file header.
++	std::string iridiumCacheFilePrefix(const std::string& identity) {
++		char prefix[32];
++		snprintf(prefix, sizeof(prefix), "iridium-%016llx-",
++			static_cast<unsigned long long>(fnv1a64(identity.data(), identity.size())));
++		return prefix;
++	}
++
++	std::string iridiumCacheFilePath(const std::string& dir, const std::string& identity, const LibraryCacheKey& key) {
++		char name[96];
++		snprintf(name, sizeof(name), "%016llx-%016llx-%zx.bin",
 +			static_cast<unsigned long long>(key.h1),
 +			static_cast<unsigned long long>(key.h2),
 +			key.length);
-+		return dir + name;
++		return dir + "/" + iridiumCacheFilePrefix(identity) + name;
++	}
++
++	// Translations left by another translator can never be read again; delete them instead of piling them up.
++	void removeForeignTranslations(const std::string& dir, const std::string& identity) {
++		const std::string own = iridiumCacheFilePrefix(identity);
++		DIR* handle = opendir(dir.c_str());
++		if (!handle) return;
++		std::vector<std::string> foreign;
++		while (const dirent* item = readdir(handle)) {
++			const std::string name = item->d_name;
++			if (name.compare(0, 8, "iridium-") == 0 && name.compare(0, own.size(), own) != 0) {
++				foreign.push_back(name);
++			}
++		}
++		closedir(handle);
++		for (const auto& name : foreign) unlink((dir + "/" + name).c_str());
 +	}
 +
 +	void writeU32(std::vector<uint8_t>& out, uint32_t v) {
@@ -3543,12 +3599,12 @@ index 322e186..4db08bf 100644
 +		}
 +	};
 +
-+	bool loadTranslatedLibraryFromDisk(const std::string& path, size_t expectedInputLength, CachedTranslatedLibrary& out) {
++	bool loadTranslatedLibraryFromDisk(const std::string& path, const std::string& identity, size_t expectedInputLength, CachedTranslatedLibrary& out) {
 +		FILE* f = fopen(path.c_str(), "rb");
 +		if (!f) return false;
 +		if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return false; }
 +		long fileSize = ftell(f);
-+		if (fileSize < 28 || fseek(f, 0, SEEK_SET) != 0) { fclose(f); return false; }
++		if (fileSize < 40 || fseek(f, 0, SEEK_SET) != 0) { fclose(f); return false; }
 +		std::vector<uint8_t> buf(static_cast<size_t>(fileSize));
 +		if (fread(buf.data(), 1, buf.size(), f) != buf.size()) {
 +			fclose(f);
@@ -3558,10 +3614,15 @@ index 322e186..4db08bf 100644
 +
 +		ByteReader r {buf.data(), buf.size(), 0};
 +		char magic[8];
++		std::string writerIdentity;
++		uint64_t bodyHash = 0;
 +		uint64_t inputLength = 0;
 +		uint64_t spirvSize = 0;
 +		uint32_t numFunctions = 0;
 +		if (!r.readBytes(magic, sizeof(magic)) || memcmp(magic, kIridiumCacheMagic, sizeof(magic)) != 0) return false;
++		if (!r.readString(writerIdentity) || writerIdentity != identity) return false;
++		// The hash covers every byte after it, so a damaged entry is translated again instead of being used.
++		if (!r.readU64(bodyHash) || bodyHash != fnv1a64(r.data + r.offset, r.size - r.offset)) return false;
 +		if (!r.readU64(inputLength) || inputLength != expectedInputLength) return false;
 +		if (!r.readU64(spirvSize) || spirvSize == 0 || (spirvSize & 3) != 0 || spirvSize > r.size - r.offset) return false;
 +		out.spirv.resize(static_cast<size_t>(spirvSize));
@@ -3616,10 +3677,13 @@ index 322e186..4db08bf 100644
 +		return r.offset == r.size;
 +	}
 +
-+	void saveTranslatedLibraryToDisk(const std::string& path, size_t inputLength, const CachedTranslatedLibrary& entry) {
++	void saveTranslatedLibraryToDisk(const std::string& path, const std::string& identity, size_t inputLength, const CachedTranslatedLibrary& entry) {
 +		std::vector<uint8_t> buf;
-+		buf.reserve(64 + entry.spirv.size());
++		buf.reserve(128 + identity.size() + entry.spirv.size());
 +		writeBytes(buf, kIridiumCacheMagic, sizeof(kIridiumCacheMagic));
++		writeString(buf, identity);
++		const size_t bodyHashOffset = buf.size();
++		writeU64(buf, 0);
 +		writeU64(buf, static_cast<uint64_t>(inputLength));
 +		writeU64(buf, static_cast<uint64_t>(entry.spirv.size()));
 +		writeBytes(buf, entry.spirv.data(), entry.spirv.size());
@@ -3651,6 +3715,9 @@ index 322e186..4db08bf 100644
 +				}
 +			}
 +		}
++		const size_t bodyOffset = bodyHashOffset + sizeof(uint64_t);
++		const uint64_t bodyHash = fnv1a64(buf.data() + bodyOffset, buf.size() - bodyOffset);
++		memcpy(buf.data() + bodyHashOffset, &bodyHash, sizeof(bodyHash));
 +
 +		std::string tmpPath = path + ".tmp." + std::to_string(getpid());
 +		if (FILE* f = fopen(tmpPath.c_str(), "wb")) {
@@ -3662,6 +3729,28 @@ index 322e186..4db08bf 100644
 +			}
 +		}
 +		unlink(tmpPath.c_str());
++	}
++
++	// Fills `entry` from the entry on disk for this translator, or from `translate` when there is none or it
++	// cannot be used, and then stores the fresh result. An empty `dir` or `identity` turns the disk cache off:
++	// without an identity, a stored translation could not be told apart from one made by another translator.
++	template<typename Translate>
++	bool loadOrTranslateLibrary(const std::string& dir, const std::string& identity, const LibraryCacheKey& key, CachedTranslatedLibrary& entry, Translate&& translate) {
++		const std::string diskPath = (dir.empty() || identity.empty()) ? std::string() : iridiumCacheFilePath(dir, identity, key);
++		if (!diskPath.empty()) {
++			// A rejected entry may be half parsed; never let it leak into the translated result.
++			CachedTranslatedLibrary loaded;
++			if (loadTranslatedLibraryFromDisk(diskPath, identity, key.length, loaded)) {
++				entry.spirv = std::move(loaded.spirv);
++				entry.outputInfo = std::move(loaded.outputInfo);
++				return true;
++			}
++		}
++		if (!translate(entry)) return false;
++		if (!diskPath.empty()) {
++			saveTranslatedLibraryToDisk(diskPath, identity, key.length, entry);
++		}
++		return true;
 +	}
 +}
 +
@@ -3702,11 +3791,10 @@ index 322e186..4db08bf 100644
 +		}
 +	}
 +
-+	auto& state = pipelineCacheState();
 +	{
-+		std::lock_guard<std::mutex> lock(state.mutex);
-+		state.path = cachePath;
-+		state.lastSaveNs.store(0, std::memory_order_relaxed);
++		std::lock_guard<std::mutex> lock(_pipelineCacheMutex);
++		_pipelineCachePath = cachePath;
++		_pipelineCacheLastSaveNs.store(0, std::memory_order_relaxed);
 +	}
 +
 +	VkPipelineCacheCreateInfo createInfo {};
@@ -3723,10 +3811,9 @@ index 322e186..4db08bf 100644
 +
 +void Indium::PrivateDevice::notePipelineCreated() {
 +	if (!_pipelineCache) return;
-+	auto& state = pipelineCacheState();
-+	uint32_t pending = state.unsaved.fetch_add(1, std::memory_order_relaxed) + 1;
++	uint32_t pending = _pipelineCacheUnsaved.fetch_add(1, std::memory_order_relaxed) + 1;
 +	uint64_t now = monotonicNs();
-+	uint64_t last = state.lastSaveNs.load(std::memory_order_relaxed);
++	uint64_t last = _pipelineCacheLastSaveNs.load(std::memory_order_relaxed);
 +	if (pending >= 8 || last == 0 || (now > last && (now - last) >= 250000000ULL)) {
 +		savePipelineCache();
 +	}
@@ -3734,9 +3821,8 @@ index 322e186..4db08bf 100644
 +
 +void Indium::PrivateDevice::savePipelineCache() {
 +	if (!_pipelineCache || !DynamicVK::vkGetPipelineCacheData.isAvailable()) return;
-+	auto& state = pipelineCacheState();
-+	std::lock_guard<std::mutex> lock(state.mutex);
-+	if (state.path.empty() || state.unsaved.load(std::memory_order_relaxed) == 0) return;
++	std::lock_guard<std::mutex> lock(_pipelineCacheMutex);
++	if (_pipelineCachePath.empty() || _pipelineCacheUnsaved.load(std::memory_order_relaxed) == 0) return;
 +
 +	size_t dataSize = 0;
 +	if (DynamicVK::vkGetPipelineCacheData(_device, _pipelineCache, &dataSize, nullptr) != VK_SUCCESS ||
@@ -3747,13 +3833,13 @@ index 322e186..4db08bf 100644
 +	if (DynamicVK::vkGetPipelineCacheData(_device, _pipelineCache, &dataSize, data.data()) != VK_SUCCESS) {
 +		return;
 +	}
-+	std::string tmpPath = state.path + ".tmp." + std::to_string(getpid());
++	std::string tmpPath = _pipelineCachePath + ".tmp." + std::to_string(getpid());
 +	if (FILE* f = fopen(tmpPath.c_str(), "wb")) {
 +		bool ok = fwrite(data.data(), 1, dataSize, f) == dataSize;
 +		fclose(f);
-+		if (ok && rename(tmpPath.c_str(), state.path.c_str()) == 0) {
-+			state.unsaved.store(0, std::memory_order_relaxed);
-+			state.lastSaveNs.store(monotonicNs(), std::memory_order_relaxed);
++		if (ok && rename(tmpPath.c_str(), _pipelineCachePath.c_str()) == 0) {
++			_pipelineCacheUnsaved.store(0, std::memory_order_relaxed);
++			_pipelineCacheLastSaveNs.store(monotonicNs(), std::memory_order_relaxed);
 +			return;
 +		}
 +	}
@@ -3774,7 +3860,7 @@ index 322e186..4db08bf 100644
  	if (_oneshotCommandPool) {
  		DynamicVK::vkDestroyCommandPool(_device, _oneshotCommandPool, nullptr);
  	}
-@@ -308,6 +989,23 @@ std::string Indium::PrivateDevice::name() const {
+@@ -308,6 +1044,23 @@ std::string Indium::PrivateDevice::name() const {
  	return _properties.deviceName;
  };
  
@@ -3798,7 +3884,7 @@ index 322e186..4db08bf 100644
  std::shared_ptr<Indium::CommandQueue> Indium::PrivateDevice::newCommandQueue() {
  	return std::make_shared<PrivateCommandQueue>(shared_from_this());
  };
-@@ -317,9 +1015,9 @@ std::shared_ptr<Indium::RenderPipelineState> Indium::PrivateDevice::newRenderPip
+@@ -317,9 +1070,9 @@ std::shared_ptr<Indium::RenderPipelineState> Indium::PrivateDevice::newRenderPip
  };
  
  std::shared_ptr<Indium::ComputePipelineState> Indium::PrivateDevice::newComputePipelineState(const ComputePipelineDescriptor& descriptor, PipelineOption options, std::shared_ptr<ComputePipelineReflection> reflection) {
@@ -3811,7 +3897,7 @@ index 322e186..4db08bf 100644
  	return std::make_shared<PrivateComputePipelineState>(shared_from_this(), descriptor);
  };
  
-@@ -336,10 +1034,54 @@ std::shared_ptr<Indium::Buffer> Indium::PrivateDevice::newBuffer(const void* poi
+@@ -336,10 +1089,57 @@ std::shared_ptr<Indium::Buffer> Indium::PrivateDevice::newBuffer(const void* poi
  };
  
  std::shared_ptr<Indium::Library> Indium::PrivateDevice::newLibrary(const void* data, size_t length) {
@@ -3837,25 +3923,28 @@ index 322e186..4db08bf 100644
 +
 +	if (!cached) {
 +		auto entry = std::make_shared<CachedTranslatedLibrary>();
-+		std::string cacheDir = indiumCacheDir();
-+		std::string diskPath = cacheDir.empty() ? std::string() : iridiumCacheFilePath(cacheDir, key);
-+		if (diskPath.empty() || !loadTranslatedLibraryFromDisk(diskPath, length, *entry)) {
++		const std::string cacheDir = indiumCacheDir();
++		const std::string identity = Iridium::translatorIdentity();
++		if (!cacheDir.empty() && !identity.empty()) {
++			static std::once_flag foreignTranslationsRemoved;
++			std::call_once(foreignTranslationsRemoved, [&]() { removeForeignTranslations(cacheDir, identity); });
++		}
++		const bool translated = loadOrTranslateLibrary(cacheDir, identity, key, *entry, [&](CachedTranslatedLibrary& fresh) {
 +			size_t translatedSize = 0;
 +			uint64_t translateStart = SlowLog::enabled() ? SlowLog::now() : 0;
-+			auto translatedData = Iridium::translate(data, length, translatedSize, entry->outputInfo);
++			auto translatedData = Iridium::translate(data, length, translatedSize, fresh.outputInfo);
 +			if (translateStart) {
 +				SlowLog::write("translate", static_cast<double>(SlowLog::now() - translateStart) / 1e6, nullptr, nullptr, translatedSize);
 +			}
 +			if (!translatedData || translatedSize == 0) {
 +				if (translatedData) free(translatedData);
-+				return nullptr;
++				return false;
 +			}
-+			entry->spirv.assign(static_cast<const char*>(translatedData), static_cast<const char*>(translatedData) + translatedSize);
++			fresh.spirv.assign(static_cast<const char*>(translatedData), static_cast<const char*>(translatedData) + translatedSize);
 +			free(translatedData);
-+			if (!diskPath.empty()) {
-+				saveTranslatedLibraryToDisk(diskPath, length, *entry);
-+			}
-+		}
++			return true;
++		});
++		if (!translated) return nullptr;
 +		std::lock_guard<std::mutex> lock(libraryCacheMutex());
 +		auto [it, inserted] = libraryCacheMap().emplace(key, entry);
 +		cached = it->second;
@@ -3870,7 +3959,7 @@ index 322e186..4db08bf 100644
  	PrivateLibrary::FunctionInfoMap funcInfoMap;
  
  	for (const auto& [name, info]: outputInfo.functionInfos) {
-@@ -357,12 +1099,43 @@ std::shared_ptr<Indium::Library> Indium::PrivateDevice::newLibrary(const void* d
+@@ -357,12 +1157,43 @@ std::shared_ptr<Indium::Library> Indium::PrivateDevice::newLibrary(const void* d
  				break;
  		}
  
@@ -3916,7 +4005,7 @@ index 322e186..4db08bf 100644
  	return lib;
  };
  
-@@ -382,6 +1155,19 @@ std::shared_ptr<Indium::Device> Indium::createSystemDefaultDevice() {
+@@ -382,6 +1213,19 @@ std::shared_ptr<Indium::Device> Indium::createSystemDefaultDevice() {
  	return globalDeviceList.empty() ? nullptr : globalDeviceList.front();
  };
  
@@ -3936,7 +4025,7 @@ index 322e186..4db08bf 100644
  void Indium::PrivateDevice::pollEvents(uint64_t timeoutNanoseconds) {
  	// this is held for the entire duration of the poll so we can
  	// ensure we're the only one polling, which allows us to avoid
-@@ -393,9 +1179,35 @@ void Indium::PrivateDevice::pollEvents(uint64_t timeoutNanoseconds) {
+@@ -393,9 +1237,35 @@ void Indium::PrivateDevice::pollEvents(uint64_t timeoutNanoseconds) {
  	const std::vector<VkSemaphore> semaphores = _eventLoopSemaphores;
  	const std::vector<uint64_t> values = _eventLoopWaitValues;
  	const std::vector<std::function<void()>> callbacks = _eventLoopCallbacks;
@@ -3972,7 +4061,7 @@ index 322e186..4db08bf 100644
  	VkSemaphoreWaitInfo info {};
  	info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
  	info.semaphoreCount = semaphores.size();
-@@ -403,7 +1215,19 @@ void Indium::PrivateDevice::pollEvents(uint64_t timeoutNanoseconds) {
+@@ -403,7 +1273,19 @@ void Indium::PrivateDevice::pollEvents(uint64_t timeoutNanoseconds) {
  	info.pValues = values.data();
  	info.flags = VK_SEMAPHORE_WAIT_ANY_BIT;
  
@@ -3993,7 +4082,7 @@ index 322e186..4db08bf 100644
  
  	if (result == VK_TIMEOUT) {
  		// timed out with no semaphores ready
-@@ -474,15 +1298,30 @@ void Indium::PrivateDevice::waitForSemaphore(VkSemaphore semaphore, uint64_t tar
+@@ -474,15 +1356,30 @@ void Indium::PrivateDevice::waitForSemaphore(VkSemaphore semaphore, uint64_t tar
  		_eventLoopSemaphores.push_back(semaphore);
  		_eventLoopWaitValues.push_back(targetValue);
  		_eventLoopCallbacks.push_back(callback);
@@ -4027,7 +4116,7 @@ index 322e186..4db08bf 100644
  	VkSemaphoreTypeCreateInfo typeInfo {};
  	typeInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
  	typeInfo.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
-@@ -505,7 +1344,14 @@ Indium::TimelineSemaphore Indium::PrivateDevice::getTimelineSemaphore() {
+@@ -505,7 +1402,14 @@ Indium::TimelineSemaphore Indium::PrivateDevice::getTimelineSemaphore() {
  };
  
  void Indium::PrivateDevice::putTimelineSemaphore(const TimelineSemaphore& semaphore) {
@@ -4043,7 +4132,7 @@ index 322e186..4db08bf 100644
  };
  
  std::shared_ptr<Indium::TimelineSemaphore> Indium::PrivateDevice::getWrappedTimelineSemaphore() {
-@@ -551,3 +1397,164 @@ std::shared_ptr<Indium::BinarySemaphore> Indium::PrivateDevice::getWrappedBinary
+@@ -551,3 +1455,164 @@ std::shared_ptr<Indium::BinarySemaphore> Indium::PrivateDevice::getWrappedBinary
  		delete ptr;
  	});
  };
@@ -4398,7 +4487,7 @@ index d56a213..d416ace 100644
 +
 +const std::vector<Iridium::ArgumentInfo>& Indium::PrivateFunction::argumentInfo() const { return _functionInfo.arguments; }
 diff --git a/src/indium/render-command-encoder.cpp b/src/indium/render-command-encoder.cpp
-index b27ffe5..c9f5289 100644
+index b27ffe5..4210d15 100644
 --- a/src/indium/render-command-encoder.cpp
 +++ b/src/indium/render-command-encoder.cpp
 @@ -1,3 +1,9 @@
@@ -5133,17 +5222,17 @@ index b27ffe5..c9f5289 100644
  	switch (primitiveType) {
  		case PrimitiveType::Point:
 -			pipeline = _privatePSO->pipelines()[0];
-+			pipeline = _privatePSO->pipelineForTopologyIndex(0);
++			pipeline = _privatePSO->pipelineForTopologyIndex(0, _renderPass);
  			break;
  		case PrimitiveType::Line:
  		case PrimitiveType::LineStrip:
 -			pipeline = _privatePSO->pipelines()[1];
-+			pipeline = _privatePSO->pipelineForTopologyIndex(1);
++			pipeline = _privatePSO->pipelineForTopologyIndex(1, _renderPass);
  			break;
  		case PrimitiveType::Triangle:
  		case PrimitiveType::TriangleStrip:
 -			pipeline = _privatePSO->pipelines()[2];
-+			pipeline = _privatePSO->pipelineForTopologyIndex(2);
++			pipeline = _privatePSO->pipelineForTopologyIndex(2, _renderPass);
  			break;
  		default:
  			throw BadEnumValue();
@@ -5334,17 +5423,17 @@ index b27ffe5..c9f5289 100644
  	switch (primitiveType) {
  		case PrimitiveType::Point:
 -			pipeline = _privatePSO->pipelines()[0];
-+			pipeline = _privatePSO->pipelineForTopologyIndex(0);
++			pipeline = _privatePSO->pipelineForTopologyIndex(0, _renderPass);
  			break;
  		case PrimitiveType::Line:
  		case PrimitiveType::LineStrip:
 -			pipeline = _privatePSO->pipelines()[1];
-+			pipeline = _privatePSO->pipelineForTopologyIndex(1);
++			pipeline = _privatePSO->pipelineForTopologyIndex(1, _renderPass);
  			break;
  		case PrimitiveType::Triangle:
  		case PrimitiveType::TriangleStrip:
 -			pipeline = _privatePSO->pipelines()[2];
-+			pipeline = _privatePSO->pipelineForTopologyIndex(2);
++			pipeline = _privatePSO->pipelineForTopologyIndex(2, _renderPass);
  			break;
  		default:
  			throw BadEnumValue();
@@ -5447,7 +5536,7 @@ index b27ffe5..c9f5289 100644
 +    DynamicVK::vkCmdPipelineBarrier(buf->commandBuffer(), stages, stages, VK_DEPENDENCY_BY_REGION_BIT, 1, &barrier, 0, nullptr, 0, nullptr);
 +}
 diff --git a/src/indium/render-pipeline.cpp b/src/indium/render-pipeline.cpp
-index 1b6bb3b..4674d2e 100644
+index 1b6bb3b..76d6a18 100644
 --- a/src/indium/render-pipeline.cpp
 +++ b/src/indium/render-pipeline.cpp
 @@ -1,10 +1,19 @@
@@ -5613,12 +5702,10 @@ index 1b6bb3b..4674d2e 100644
  			DynamicVK::vkDestroyPipeline(_privateDevice->device(), pipeline, nullptr);
  			pipeline = VK_NULL_HANDLE;
  		}
-@@ -59,14 +175,64 @@ void Indium::PrivateRenderPipelineState::recreatePipeline(VkRenderPass compatibl
+@@ -59,14 +175,66 @@ void Indium::PrivateRenderPipelineState::recreatePipeline(VkRenderPass compatibl
  		_pipelineLayout = VK_NULL_HANDLE;
  	}
  
-+	_compatibleRenderPass = compatibleRenderPass;
-+
 +	std::vector<size_t> inputLocations;
 +	for (const auto& binding : _vertexFunction->functionInfo().bindings)
 +		if (binding.type == Iridium::BindingType::VertexInput) inputLocations.push_back(binding.index);
@@ -5647,15 +5734,19 @@ index 1b6bb3b..4674d2e 100644
 +	} else if (_primitiveTopology == PrimitiveTopologyClass::Line) {
 +		primaryIndex = 1;
 +	}
-+	pipelineForTopologyIndex(primaryIndex);
++	pipelineForTopologyIndex(primaryIndex, compatibleRenderPass);
 +};
 +
-+VkPipeline Indium::PrivateRenderPipelineState::pipelineForTopologyIndex(size_t index) {
++VkPipeline Indium::PrivateRenderPipelineState::pipelineForTopologyIndex(size_t index, VkRenderPass compatibleRenderPass) {
 +	if (index >= _pipelines.size()) {
 +		abort();
 +	}
-+	if (_pipelines[index]) {
-+		return _pipelines[index];
++	if (VkPipeline existing = _pipelines[index].load(std::memory_order_acquire)) {
++		return existing;
++	}
++	std::lock_guard<std::mutex> lock(_lazyPipelineMutex);
++	if (VkPipeline existing = _pipelines[index].load(std::memory_order_relaxed)) {
++		return existing;
 +	}
 +
  	auto vertexFunctionName = _vertexFunction->name();
@@ -5678,7 +5769,7 @@ index 1b6bb3b..4674d2e 100644
  	shaderStage.module = _vertexFunction->library()->shaderModule();
  	shaderStage.pName = vertexFunctionName.c_str();
  	stages.push_back(shaderStage);
-@@ -82,51 +248,15 @@ void Indium::PrivateRenderPipelineState::recreatePipeline(VkRenderPass compatibl
+@@ -82,51 +250,15 @@ void Indium::PrivateRenderPipelineState::recreatePipeline(VkRenderPass compatibl
  	std::vector<VkVertexInputBindingDescription> vertexBindingDescs;
  	std::vector<VkVertexInputAttributeDescription> vertexAttrDescs;
  
@@ -5735,11 +5826,11 @@ index 1b6bb3b..4674d2e 100644
 +    const auto plan = vertexInputPlan(_vertexDescriptor.value_or(VertexDescriptor{}), inputLocations);
 +    vertexBindingDescs = plan.bindings;
 +    vertexAttrDescs = plan.attributes;
-+    _vertexInputBindings = plan.metalBindings;
++    // recreatePipeline has set _vertexInputBindings from the same plan; encoders may be reading it now.
  
  	vertexInputState.vertexBindingDescriptionCount = vertexBindingDescs.size();
  	vertexInputState.pVertexBindingDescriptions = vertexBindingDescs.data();
-@@ -135,6 +265,8 @@ void Indium::PrivateRenderPipelineState::recreatePipeline(VkRenderPass compatibl
+@@ -135,6 +267,8 @@ void Indium::PrivateRenderPipelineState::recreatePipeline(VkRenderPass compatibl
  
  	VkPipelineInputAssemblyStateCreateInfo inputAssemblyState {};
  	inputAssemblyState.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
@@ -5748,7 +5839,7 @@ index 1b6bb3b..4674d2e 100644
  
  	VkPipelineTessellationStateCreateInfo tesselationState {};
  	tesselationState.sType = VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO;
-@@ -144,8 +276,6 @@ void Indium::PrivateRenderPipelineState::recreatePipeline(VkRenderPass compatibl
+@@ -144,8 +278,6 @@ void Indium::PrivateRenderPipelineState::recreatePipeline(VkRenderPass compatibl
  
  	VkPipelineRasterizationStateCreateInfo rasterizationState {};
  	rasterizationState.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
@@ -5757,7 +5848,7 @@ index 1b6bb3b..4674d2e 100644
  	rasterizationState.polygonMode = VK_POLYGON_MODE_FILL;
  	rasterizationState.lineWidth = 1.0f;
  
-@@ -168,6 +298,7 @@ void Indium::PrivateRenderPipelineState::recreatePipeline(VkRenderPass compatibl
+@@ -168,6 +300,7 @@ void Indium::PrivateRenderPipelineState::recreatePipeline(VkRenderPass compatibl
  		tmp.dstAlphaBlendFactor = blendFactorToVkBlendFactor(colorInfo.destinationAlphaBlendFactor);
  		tmp.alphaBlendOp = blendOperationToVkBlendOp(colorInfo.alphaBlendOperation);
  		tmp.colorWriteMask = colorWriteMaskToVkColorComponentFlags(colorInfo.writeMask);
@@ -5765,7 +5856,7 @@ index 1b6bb3b..4674d2e 100644
  		colorBlendStates.push_back(tmp);
  	}
  	VkPipelineColorBlendStateCreateInfo colorBlendState {};
-@@ -204,20 +335,6 @@ void Indium::PrivateRenderPipelineState::recreatePipeline(VkRenderPass compatibl
+@@ -204,20 +337,6 @@ void Indium::PrivateRenderPipelineState::recreatePipeline(VkRenderPass compatibl
  	dynamicState.dynamicStateCount = dynamicStates.size();
  	dynamicState.pDynamicStates = dynamicStates.data();
  
@@ -5786,12 +5877,10 @@ index 1b6bb3b..4674d2e 100644
  	VkGraphicsPipelineCreateInfo pipelineCreateInfo {};
  	pipelineCreateInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
  	pipelineCreateInfo.stageCount = stages.size();
-@@ -232,32 +349,14 @@ void Indium::PrivateRenderPipelineState::recreatePipeline(VkRenderPass compatibl
- 	pipelineCreateInfo.pColorBlendState = &colorBlendState;
- 	pipelineCreateInfo.pDynamicState = &dynamicState;
+@@ -234,30 +353,14 @@ void Indium::PrivateRenderPipelineState::recreatePipeline(VkRenderPass compatibl
  	pipelineCreateInfo.layout = _pipelineLayout;
--	pipelineCreateInfo.renderPass = compatibleRenderPass;
--
+ 	pipelineCreateInfo.renderPass = compatibleRenderPass;
+ 
 -	// we can set the primitive topology dynamically, but unfortunately, we can only set it for a different topology
 -	// in the same topology class that the pipeline was created for. this means we need to create 3 pipelines
 -	// (one for each topology class) rather than 5 (one for each primitive topology).
@@ -5809,17 +5898,18 @@ index 1b6bb3b..4674d2e 100644
 -		// TODO
 -		abort();
 -	}
-+	pipelineCreateInfo.renderPass = _compatibleRenderPass;
- 
+-
 -	// finally, one for triangles
 -	inputAssemblyState.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 -	if (DynamicVK::vkCreateGraphicsPipelines(_privateDevice->device(), VK_NULL_HANDLE, 1, &pipelineCreateInfo, nullptr, &_pipelines[2]) != VK_SUCCESS) {
-+	if (DynamicVK::vkCreateGraphicsPipelines(_privateDevice->device(), _privateDevice->pipelineCache(), 1, &pipelineCreateInfo, nullptr, &_pipelines[index]) != VK_SUCCESS) {
++	VkPipeline pipeline = VK_NULL_HANDLE;
++	if (DynamicVK::vkCreateGraphicsPipelines(_privateDevice->device(), _privateDevice->pipelineCache(), 1, &pipelineCreateInfo, nullptr, &pipeline) != VK_SUCCESS) {
  		// TODO
  		abort();
  	}
++	_pipelines[index].store(pipeline, std::memory_order_release);
 +	_privateDevice->notePipelineCreated();
-+	return _pipelines[index];
++	return pipeline;
  };
  
  const Indium::FunctionInfo& Indium::PrivateRenderPipelineState::vertexFunctionInfo() {
@@ -6412,7 +6502,7 @@ index 1e3e971..4c18554 100644
 -	DynamicVK::vkFreeCommandBuffers(_device->device(), _device->oneshotCommandPool(), 1, &cmdBuf);
  };
 diff --git a/src/iridium/air.cpp b/src/iridium/air.cpp
-index 21c501f..9f2990b 100644
+index 21c501f..f6c6283 100644
 --- a/src/iridium/air.cpp
 +++ b/src/iridium/air.cpp
 @@ -4,9 +4,46 @@
@@ -6475,9 +6565,9 @@ index 21c501f..9f2990b 100644
 +        unsigned optNoneKind = DynamicLLVM::LLVMGetEnumAttributeKindForName("optnone", 7);
 +        auto alwaysInlineAttr = alwaysInlineKind ? DynamicLLVM::LLVMCreateEnumAttribute(ctx, alwaysInlineKind, 0) : nullptr;
 +        for (auto fn = DynamicLLVM::LLVMGetFirstFunction(moduleRef); fn; fn = DynamicLLVM::LLVMGetNextFunction(fn)) {
-+            if (DynamicLLVM::LLVMIsDeclaration(fn)) continue;
++            if (DynamicLLVM::LLVMIsDeclaration(fn) || fn == entryFn) continue;
++            // optnone requires noinline, so a helper loses both; the entry point keeps its attributes
 +            if (optNoneKind) DynamicLLVM::LLVMRemoveEnumAttributeAtIndex(fn, LLVMAttributeFunctionIndex, optNoneKind);
-+            if (fn == entryFn) continue;
 +            if (noInlineKind) DynamicLLVM::LLVMRemoveEnumAttributeAtIndex(fn, LLVMAttributeFunctionIndex, noInlineKind);
 +            if (alwaysInlineAttr) DynamicLLVM::LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex, alwaysInlineAttr);
 +        }
@@ -6634,7 +6724,76 @@ index 21c501f..9f2990b 100644
  		} break;
  
  		default:
-@@ -162,14 +315,60 @@ static Iridium::SPIRV::ResultID llvmValueToResultID(Iridium::SPIRV::Builder& bui
+@@ -146,6 +299,68 @@ static Iridium::SPIRV::ResultID llvmTypeToSPIRVType(Iridium::SPIRV::Builder& bui
+ 	}
+ };
+ 
++// AIR i1 values, and vectors of them, are SPIR-V booleans; the integer instructions do not accept them.
++static bool isBooleanLLVMType(LLVMTypeRef type) {
++	if (DynamicLLVM::LLVMGetTypeKind(type) == LLVMVectorTypeKind) type = DynamicLLVM::LLVMGetElementType(type);
++	return DynamicLLVM::LLVMGetTypeKind(type) == LLVMIntegerTypeKind && DynamicLLVM::LLVMGetIntTypeWidth(type) == 1;
++}
++
++// An integer constant whose SPIR-V type has the width llvmTypeToSPIRVType gives an AIR integer of `width` bits.
++static Iridium::SPIRV::ResultID integerConstant(Iridium::SPIRV::Builder& builder, unsigned width, uint64_t value) {
++	switch (width) {
++		case 8: return builder.declareConstantScalar<int8_t>(value);
++		case 16: return builder.declareConstantScalar<int16_t>(value);
++		case 32: return builder.declareConstantScalar<int32_t>(value);
++		case 64: return builder.declareConstantScalar<int64_t>(value);
++		default: throw std::runtime_error("Unsupported AIR integer constant width: " + std::to_string(width));
++	}
++}
++
++// The constant `value` as an integer or floating-point AIR type; a vector type gets a splat.
++static Iridium::SPIRV::ResultID numericConstant(Iridium::SPIRV::Builder& builder, LLVMTypeRef type, int value) {
++	bool isVector = DynamicLLVM::LLVMGetTypeKind(type) == LLVMVectorTypeKind;
++	auto scalarType = isVector ? DynamicLLVM::LLVMGetElementType(type) : type;
++	Iridium::SPIRV::ResultID scalar = Iridium::SPIRV::ResultIDInvalid;
++	switch (DynamicLLVM::LLVMGetTypeKind(scalarType)) {
++		case LLVMIntegerTypeKind: scalar = integerConstant(builder, DynamicLLVM::LLVMGetIntTypeWidth(scalarType), static_cast<int64_t>(value)); break;
++		case LLVMFloatTypeKind: scalar = builder.declareConstantScalar<float>(value); break;
++		case LLVMDoubleTypeKind: scalar = builder.declareConstantScalar<double>(value); break;
++		case LLVMHalfTypeKind: {
++			Iridium::Float16 tmp = static_cast<float>(value);
++			scalar = builder.declareConstantScalar<const Iridium::Float16*>(&tmp);
++		} break;
++		default: throw std::runtime_error("Unsupported AIR numeric constant type");
++	}
++	if (!isVector) return scalar;
++	return builder.declareConstantComposite(llvmTypeToSPIRVType(builder, type), std::vector<Iridium::SPIRV::ResultID>(DynamicLLVM::LLVMGetVectorSize(type), scalar));
++}
++
++// AIR reads and writes the leading scalar or vector of a local or global aggregate through the
++// aggregate's own (opaque) pointer. SPIR-V wants the access chain to that element spelled out.
++// Returns `pointer` unchanged when it already points at `valueType` or does not start with one.
++static Iridium::SPIRV::ResultID leadingElementPointer(Iridium::SPIRV::Builder& builder, Iridium::SPIRV::ResultID pointer, LLVMTypeRef llvmValueType) {
++	using namespace Iridium::SPIRV;
++	switch (DynamicLLVM::LLVMGetTypeKind(llvmValueType)) {
++		case LLVMIntegerTypeKind: case LLVMHalfTypeKind: case LLVMFloatTypeKind: case LLVMDoubleTypeKind: case LLVMVectorTypeKind: break;
++		default: return pointer;
++	}
++	auto pointerType = builder.reverseLookupType(builder.lookupResultType(pointer));
++	if (!pointerType || (pointerType->pointerStorageClass != StorageClass::Private && pointerType->pointerStorageClass != StorageClass::Function)) return pointer;
++	auto valueType = llvmTypeToSPIRVType(builder, llvmValueType);
++	size_t depth = 0;
++	for (auto current = pointerType->targetType; current != valueType; ++depth) {
++		auto type = builder.reverseLookupType(current);
++		if (type && type->backingType == Type::BackingType::Array) current = type->targetType;
++		else if (type && type->backingType == Type::BackingType::Structure && !type->structureMembers.empty()) current = type->structureMembers[0].id;
++		else return pointer;
++	}
++	if (depth == 0) return pointer;
++	auto elementPointer = builder.declareType(Type(Type::PointerTag {}, pointerType->pointerStorageClass, valueType, 8));
++	auto result = builder.encodeAccessChain(elementPointer, pointer, std::vector<ResultID>(depth, builder.declareConstantScalar<int32_t>(0)));
++	builder.setResultType(result, elementPointer);
++	return result;
++}
++
+ static std::string_view llvmMDStringToStringView(LLVMValueRef llvmMDString) {
+ 	unsigned int length = 0;
+ 	auto rawStr = DynamicLLVM::LLVMGetMDString(llvmMDString, &length);
+@@ -162,16 +377,63 @@ static Iridium::SPIRV::ResultID llvmValueToResultID(Iridium::SPIRV::Builder& bui
  	{
  		ResultID maybe = builder.lookupResultID(reinterpret_cast<uintptr_t>(llvmValue));
  		if (maybe != ResultIDInvalid) {
@@ -6652,7 +6811,7 @@ index 21c501f..9f2990b 100644
 +		if (kind == LLVMConstantIntValueKind) {
 +			auto val = DynamicLLVM::LLVMConstIntGetZExtValue(llvmValue);
 +			auto width = DynamicLLVM::LLVMGetIntTypeWidth(elementType);
-+			element = width == 1 ? builder.declareConstantBool(val != 0) : ((width <= 32) ? builder.declareConstantScalar<int32_t>(val) : builder.declareConstantScalar<int64_t>(val));
++			element = width == 1 ? builder.declareConstantBool(val != 0) : integerConstant(builder, width, val);
 +		} else {
 +			LLVMBool losesInfo = false;
 +			auto val = DynamicLLVM::LLVMConstRealGetDouble(llvmValue, &losesInfo);
@@ -6693,9 +6852,13 @@ index 21c501f..9f2990b 100644
 +				return builder.declareConstantBool(val != 0);
 +			}
  			// TODO: how to determine if it's signed or not?
- 			return (width <= 32) ? builder.declareConstantScalar<int32_t>(val) : builder.declareConstantScalar<int64_t>(val);
+-			return (width <= 32) ? builder.declareConstantScalar<int32_t>(val) : builder.declareConstantScalar<int64_t>(val);
++			// The constant has the width of its type: an i8 or i16 array element is not a 32-bit value.
++			return integerConstant(builder, width, val);
  		} break;
-@@ -191,13 +390,15 @@ static Iridium::SPIRV::ResultID llvmValueToResultID(Iridium::SPIRV::Builder& bui
+ 
+ 		case LLVMConstantFPValueKind: {
+@@ -191,13 +453,15 @@ static Iridium::SPIRV::ResultID llvmValueToResultID(Iridium::SPIRV::Builder& bui
  				} break;
  
  				default:
@@ -6714,7 +6877,7 @@ index 21c501f..9f2990b 100644
  
  			for (size_t i = 0; i < count; ++i) {
  				auto constant = DynamicLLVM::LLVMGetOperand(llvmValue, i);
-@@ -207,10 +408,11 @@ static Iridium::SPIRV::ResultID llvmValueToResultID(Iridium::SPIRV::Builder& bui
+@@ -207,10 +471,11 @@ static Iridium::SPIRV::ResultID llvmValueToResultID(Iridium::SPIRV::Builder& bui
  			return builder.declareConstantComposite(llvmTypeToSPIRVType(builder, type), vals);
  		} break;
  
@@ -6728,7 +6891,7 @@ index 21c501f..9f2990b 100644
  
  			for (size_t i = 0; i < count; ++i) {
  				auto constant = DynamicLLVM::LLVMGetElementAsConstant(llvmValue, i);
-@@ -220,7 +422,8 @@ static Iridium::SPIRV::ResultID llvmValueToResultID(Iridium::SPIRV::Builder& bui
+@@ -220,7 +485,8 @@ static Iridium::SPIRV::ResultID llvmValueToResultID(Iridium::SPIRV::Builder& bui
  			return builder.declareConstantComposite(llvmTypeToSPIRVType(builder, type), vals);
  		} break;
  
@@ -6738,7 +6901,7 @@ index 21c501f..9f2990b 100644
  			return builder.declareUndefinedValue(llvmTypeToSPIRVType(builder, type));
  		} break;
  
-@@ -231,6 +434,21 @@ static Iridium::SPIRV::ResultID llvmValueToResultID(Iridium::SPIRV::Builder& bui
+@@ -231,6 +497,26 @@ static Iridium::SPIRV::ResultID llvmValueToResultID(Iridium::SPIRV::Builder& bui
  
  		case LLVMConstantExprValueKind: {
  			switch (DynamicLLVM::LLVMGetConstOpcode(llvmValue)) {
@@ -6750,6 +6913,11 @@ index 21c501f..9f2990b 100644
 +                        throw ImpossibleResultID("Constant AIR GEP requires a zero initial index");
 +                    std::vector<ResultID> indices;
 +                    for (unsigned i=2;i<DynamicLLVM::LLVMGetNumOperands(llvmValue);++i) indices.push_back(llvmValueToResultID(builder,DynamicLLVM::LLVMGetOperand(llvmValue,i)));
++                    // The selected member has the layout mode its global or local was declared with.
++                    LayoutFreeScope layoutFree(baseType.pointerStorageClass == StorageClass::Private || baseType.pointerStorageClass == StorageClass::Function);
++                    // An access chain cannot reinterpret the base as another aggregate.
++                    if (llvmTypeToSPIRVType(builder,DynamicLLVM::LLVMGetGEPSourceElementType(llvmValue)) != baseType.targetType)
++                        throw ImpossibleResultID("Constant AIR GEP reinterprets its base: " + describeLLVMValue(llvmValue));
 +                    auto element = llvmTypeToSPIRVType(builder,gepElementType(llvmValue));
 +                    auto pointer = builder.declareType(Type(Type::PointerTag{},baseType.pointerStorageClass,element,8));
 +                    auto result = indices.empty() ? base : builder.encodeAccessChain(pointer,base,indices);
@@ -6760,7 +6928,7 @@ index 21c501f..9f2990b 100644
  				case LLVMBitCast: {
  					auto target = DynamicLLVM::LLVMGetOperand(llvmValue, 0);
  					auto targetID = llvmValueToResultID(builder, target);
-@@ -254,15 +472,375 @@ static Iridium::SPIRV::ResultID llvmValueToResultID(Iridium::SPIRV::Builder& bui
+@@ -254,13 +540,378 @@ static Iridium::SPIRV::ResultID llvmValueToResultID(Iridium::SPIRV::Builder& bui
  				} break;
  
  				default:
@@ -6772,9 +6940,9 @@ index 21c501f..9f2990b 100644
  		default:
 -			throw ImpossibleResultID();
 +			throw ImpossibleResultID("Unsupported LLVM value: " + describeLLVMValue(llvmValue));
- 	}
- };
- 
++	}
++};
++
 +
 +static std::vector<std::string_view> splitAirName(std::string_view name) {
 +	std::vector<std::string_view> parts;
@@ -6785,7 +6953,7 @@ index 21c501f..9f2990b 100644
 +		}
 +		parts.push_back(name.substr(start, dot - start));
 +		start = dot + 1;
-+	}
+ 	}
 +	return parts;
 +};
 +
@@ -6816,6 +6984,10 @@ index 21c501f..9f2990b 100644
 +	constexpr uint16_t FRem = 140;
 +	constexpr uint16_t Any = 154;
 +	constexpr uint16_t All = 155;
++	constexpr uint16_t LogicalEqual = 164;
++	constexpr uint16_t LogicalNotEqual = 165;
++	constexpr uint16_t LogicalOr = 166;
++	constexpr uint16_t LogicalAnd = 167;
 +	constexpr uint16_t Select = 169;
 +	constexpr uint16_t IEqual = 170;
 +	constexpr uint16_t INotEqual = 171;
@@ -6841,6 +7013,7 @@ index 21c501f..9f2990b 100644
 +	constexpr uint16_t FUnordGreaterThanEqual = 191;
 +	constexpr uint16_t Ordered = 162;
 +	constexpr uint16_t Unordered = 163;
++	constexpr uint16_t BitwiseAnd = 199;
 +	constexpr uint16_t DPdx = 207;
 +	constexpr uint16_t DPdy = 208;
 +	constexpr uint16_t Fwidth = 209;
@@ -7133,12 +7306,10 @@ index 21c501f..9f2990b 100644
 +	}
 +
 +	return false;
-+};
-+
+ };
+ 
  void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& outputInfo) {
- 	//auto tmp = DynamicLLVM::LLVMPrintModuleToString(_module.get());
- 	//std::cout << "    " << tmp << std::endl;
-@@ -312,7 +890,7 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
+@@ -312,7 +963,7 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
  		});
  
  		// declare the GLSL PerVertex structure
@@ -7147,7 +7318,7 @@ index 21c501f..9f2990b 100644
  			SPIRV::Type::Member {
  				vec4Type,
  				0,
-@@ -321,13 +899,21 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
+@@ -321,13 +972,21 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
  				}
  			},
  			// TODO: declare the rest of the structure
@@ -7170,7 +7341,7 @@ index 21c501f..9f2990b 100644
  
  		// declare the GLSL VertexIndex input variable
  		vertexIndexVar = builder.addGlobalVariable(ptrIntType, SPIRV::StorageClass::Input);
-@@ -425,7 +1011,7 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
+@@ -425,7 +1084,7 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
  	// if the function returns a structure, we need to separate the components
  	// into separate output variables.
  
@@ -7179,7 +7350,7 @@ index 21c501f..9f2990b 100644
  	auto funcRetType = DynamicLLVM::LLVMGetReturnType(llfuncType);
  	std::vector<LLVMTypeRef> funcParamTypes(DynamicLLVM::LLVMCountParamTypes(llfuncType));
  	DynamicLLVM::LLVMGetParamTypes(llfuncType, funcParamTypes.data());
-@@ -460,7 +1046,7 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
+@@ -460,7 +1119,7 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
  				auto type = llvmTypeToSPIRVType(builder, DynamicLLVM::LLVMStructGetTypeAtIndex(funcRetType, i));
  				auto ptrType = builder.declareType(SPIRV::Type(SPIRV::Type::PointerTag {}, SPIRV::StorageClass::Output, type, 8));
  				auto var = builder.addGlobalVariable(ptrType, SPIRV::StorageClass::Output);
@@ -7188,7 +7359,7 @@ index 21c501f..9f2990b 100644
  				++location;
  				_outputValueIDs.push_back(var);
  				builder.referenceGlobalVariable(var);
-@@ -472,13 +1058,69 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
+@@ -472,13 +1131,69 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
  		auto type = llvmTypeToSPIRVType(builder, funcRetType);
  		auto ptrType = builder.declareType(SPIRV::Type(SPIRV::Type::PointerTag {}, SPIRV::StorageClass::Output, type, 8));
  		auto var = builder.addGlobalVariable(ptrType, SPIRV::StorageClass::Output);
@@ -7259,7 +7430,7 @@ index 21c501f..9f2990b 100644
  
  	//
  	// analyze parameters and mark special values (like the vertex ID)
-@@ -519,7 +1161,9 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
+@@ -519,7 +1234,9 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
  			auto kind = llvmMDStringToStringView(parameterInfo[1]);
  
  			if (kind == "air.buffer") {
@@ -7270,7 +7441,7 @@ index 21c501f..9f2990b 100644
  				auto addrPtrTypeInst = SPIRV::Type(SPIRV::Type::PointerTag {}, SPIRV::StorageClass::PhysicalStorageBuffer, type, 8);
  				auto addrPtrType = builder.declareType(addrPtrTypeInst);
  				bufferMembers.push_back(SPIRV::Type::Member { addrPtrType, 8 * bufferIndex, {} });
-@@ -575,7 +1219,21 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
+@@ -575,7 +1292,21 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
  			_parameterIDs.push_back(load);
  			builder.associateExistingResultID(load, llparamVal);
  			builder.setResultType(load, intType);
@@ -7293,7 +7464,7 @@ index 21c501f..9f2990b 100644
  			// find the location index info
  			size_t infoIdx = 0;
  			for (; infoIdx < parameterInfo.size(); ++infoIdx) {
-@@ -620,7 +1278,7 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
+@@ -620,7 +1351,7 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
  			auto var = builder.addGlobalVariable(ptrType, SPIRV::StorageClass::Input);
  			auto load = builder.encodeLoad(type, var);
  
@@ -7302,7 +7473,7 @@ index 21c501f..9f2990b 100644
  			++paramLocation;
  
  			builder.referenceGlobalVariable(var);
-@@ -631,9 +1289,18 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
+@@ -631,9 +1362,18 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
  			builder.setResultType(load, type);
  		} else if (kind == "air.vertex_input") {
  			auto type = llvmTypeToSPIRVType(builder, funcParamTypes[i]);
@@ -7323,7 +7494,7 @@ index 21c501f..9f2990b 100644
  
  			// find the location index info
  			size_t infoIdx = 0;
-@@ -761,14 +1428,19 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
+@@ -761,14 +1501,19 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
  				realSampleType = fakeSampleType;
  			}
  
@@ -7351,7 +7522,7 @@ index 21c501f..9f2990b 100644
  			auto imagePtrType = builder.declareType(SPIRV::Type(SPIRV::Type::PointerTag {}, SPIRV::StorageClass::UniformConstant, imageType, 8));
  			auto var = builder.addGlobalVariable(imagePtrType, SPIRV::StorageClass::UniformConstant);
  			//auto load = builder.encodeLoad(imageType, var);
-@@ -959,68 +1631,98 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
+@@ -959,68 +1704,98 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
  	enum class CFGType {
  		None = 0,
  		Selection,
@@ -7499,7 +7670,7 @@ index 21c501f..9f2990b 100644
  		if (isFirst) {
  			isFirst = false;
  
-@@ -1030,16 +1732,54 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
+@@ -1030,16 +1805,59 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
  			builder.insertLabel(builder.lookupResultID(reinterpret_cast<uintptr_t>(bb)));
  		}
  
@@ -7519,6 +7690,20 @@ index 21c501f..9f2990b 100644
 +                case LLVMUIToFP: case LLVMSIToFP: case LLVMFPExt: {
 +                    auto source=DynamicLLVM::LLVMGetOperand(inst,0);auto arg=llvmValueToResultID(builder,source);
 +                    auto type=llvmTypeToSPIRVType(builder,DynamicLLVM::LLVMTypeOf(inst));
++                    auto sourceLLType=DynamicLLVM::LLVMTypeOf(source);auto targetLLType=DynamicLLVM::LLVMTypeOf(inst);
++                    if(isBooleanLLVMType(sourceLLType)||isBooleanLLVMType(targetLLType)){
++                        // AIR i1 is a SPIR-V boolean, which the conversion instructions do not accept.
++                        SPIRV::ResultID result=SPIRV::ResultIDInvalid;
++                        if(opcode==LLVMSExt||opcode==LLVMSIToFP)result=builder.encodeRawOp(SPIRVOp::Select,type,{arg,numericConstant(builder,targetLLType,-1),numericConstant(builder,targetLLType,0)});
++                        else if(opcode==LLVMUIToFP)result=builder.encodeRawOp(SPIRVOp::Select,type,{arg,numericConstant(builder,targetLLType,1),numericConstant(builder,targetLLType,0)});
++                        else if(opcode==LLVMTrunc){
++                            // truncation to i1 keeps the lowest bit
++                            auto bit=builder.encodeRawOp(SPIRVOp::BitwiseAnd,llvmTypeToSPIRVType(builder,sourceLLType),{arg,numericConstant(builder,sourceLLType,1)});
++                            result=builder.encodeRawOp(SPIRVOp::INotEqual,type,{bit,numericConstant(builder,sourceLLType,0)});
++                        }else throw std::runtime_error("Unsupported AIR boolean conversion: "+describeLLVMValue(inst));
++                        builder.associateExistingResultID(result,reinterpret_cast<uintptr_t>(inst));builder.setResultType(result,type);
++                        break;
++                    }
 +                    uint16_t op=opcode==LLVMSExt?114:(opcode==LLVMTrunc?113:(opcode==LLVMFPToUI?109:(opcode==LLVMFPToSI?110:(opcode==LLVMUIToFP?112:(opcode==LLVMSIToFP?111:115)))));
 +                    auto resultType=opcode==LLVMFPToUI?integerTypeWithSign(builder,type,false):type;
 +                    if(opcode==LLVMUIToFP){auto unsignedType=integerTypeWithSign(builder,llvmTypeToSPIRVType(builder,DynamicLLVM::LLVMTypeOf(source)),false);arg=builder.encodeBitcast(unsignedType,arg);}
@@ -7540,22 +7725,13 @@ index 21c501f..9f2990b 100644
 +					// AIR i1 is a SPIR-V boolean, not an integer accepted by OpUConvert.
 +					// Keep the declared destination type so later PHIs see the same signedness.
 +					auto sourceType = DynamicLLVM::LLVMTypeOf(source);
-+					auto constant = [&](int value) {
-+						switch (DynamicLLVM::LLVMGetIntTypeWidth(targetType)) {
-+							case 8: return builder.declareConstantScalar<int8_t>(value);
-+							case 16: return builder.declareConstantScalar<int16_t>(value);
-+							case 32: return builder.declareConstantScalar<int32_t>(value);
-+							case 64: return builder.declareConstantScalar<int64_t>(value);
-+							default: throw std::runtime_error("Unsupported AIR boolean extension width");
-+						}
-+					};
-+					auto resID = DynamicLLVM::LLVMGetTypeKind(sourceType) == LLVMIntegerTypeKind && DynamicLLVM::LLVMGetIntTypeWidth(sourceType) == 1
-+						? builder.encodeRawOp(169, type, {argument, constant(1), constant(0)})
++					auto resID = isBooleanLLVMType(sourceType)
++						? builder.encodeRawOp(169, type, {argument, numericConstant(builder, targetType, 1), numericConstant(builder, targetType, 0)})
 +						: builder.encodeBitcast(type, builder.encodeUConvert(type, argument));
  
  					builder.associateExistingResultID(resID, reinterpret_cast<uintptr_t>(inst));
  					builder.setResultType(resID, type);
-@@ -1048,6 +1788,18 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
+@@ -1048,6 +1866,18 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
  				// TODO: look into using physical addressing instead of logical addressing, which should simplify the translation process
  				//       (since i *think* that's the same addressing mode used by Metal code)
  
@@ -7574,7 +7750,7 @@ index 21c501f..9f2990b 100644
  				case LLVMGetElementPtr: {
  					auto base = DynamicLLVM::LLVMGetOperand(inst, 0);
  					auto targetType = DynamicLLVM::LLVMTypeOf(inst);
-@@ -1060,17 +1812,32 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
+@@ -1060,17 +1890,32 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
  						indices.push_back(llvmValueToResultID(builder, llindex));
  					}
  
@@ -7608,17 +7784,27 @@ index 21c501f..9f2990b 100644
  					// strangely enough, SPIR-V provides no instruction that can do an initial pointer offset like LLVM's GEP does.
  					// there's OpPtrAccessChain, which is tantalizingly named, but unfortunately that instruction doesn't work as expected
  					// either. i've tried using the raw index (i.e. in element units) and the multiplied index (i.e. in bytes), but no dice.
-@@ -1112,6 +1879,9 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
+@@ -1112,6 +1957,10 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
  						op = access;
  					}
  
++                    op = leadingElementPointer(builder, op, targetType);
 +                    // Opaque LLVM pointers may be used with more than one load type.
 +                    auto currentPointer=*builder.reverseLookupType(builder.lookupResultType(op));
 +                    if(currentPointer.targetType!=type){auto pointer=builder.declareType(SPIRV::Type(SPIRV::Type::PointerTag{},currentPointer.pointerStorageClass,type,8));op=builder.encodeBitcast(pointer,op);builder.setResultType(op,pointer);}
  					auto resID = builder.encodeLoad(type, op, alignment);
  
  					builder.associateExistingResultID(resID, reinterpret_cast<uintptr_t>(inst));
-@@ -1149,50 +1919,8 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
+@@ -1123,7 +1972,7 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
+ 					auto llval = DynamicLLVM::LLVMGetOperand(inst, 0);
+ 					auto llptr = DynamicLLVM::LLVMGetOperand(inst, 1);
+ 					auto val = llvmValueToResultID(builder, llval);
+-					auto ptr = llvmValueToResultID(builder, llptr);
++					auto ptr = leadingElementPointer(builder, llvmValueToResultID(builder, llptr), DynamicLLVM::LLVMTypeOf(llval));
+ 
+ 					// TODO: also handle runtime arrays properly here
+ 
+@@ -1149,50 +1998,8 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
  						auto arg = DynamicLLVM::LLVMGetOperand(inst, 0);
  
  						resID = builder.encodeConvertUToF(type, llvmValueToResultID(builder, arg));
@@ -7671,12 +7857,14 @@ index 21c501f..9f2990b 100644
  						auto arg = DynamicLLVM::LLVMGetOperand(inst, 0);
  
  						resID = builder.encodeFConvert(type, llvmValueToResultID(builder, arg));
-@@ -1223,14 +1951,33 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
+@@ -1223,14 +2030,39 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
  						auto operand2 = DynamicLLVM::LLVMGetOperand(inst, 1);
  
  						resID = builder.encodeFMax(type, llvmValueToResultID(builder, operand1), llvmValueToResultID(builder, operand2));
 +					} else if (translateAirIntrinsic(builder, inst, name, type, resID, blockTerminated)) {
 +						// handled
++					} else if (name.substr(0, 14) == "llvm.lifetime.") {
++						// always-inline adds lifetime markers; they carry no semantics for SPIR-V.
  					} else {
 -						throw std::runtime_error(std::string("TODO: support actual function calls (name = ") + name.data() + ")");
 +						throw std::runtime_error(std::string("TODO: support actual function calls (name = ") + std::string(name) + ")");
@@ -7701,14 +7889,18 @@ index 21c501f..9f2990b 100644
 +                      case LLVMUDiv:op=134;break;case LLVMSDiv:op=135;break;case LLVMURem:op=137;break;case LLVMSRem:op=138;break;
 +                      case LLVMShl:op=196;break;case LLVMLShr:op=194;break;case LLVMAShr:op=195;break;
 +                      case LLVMAnd:op=199;break;case LLVMOr:op=197;break;case LLVMXor:op=198;break;default:break;}
-+                    auto t=*builder.reverseLookupType(type);
-+                    if(t.backingType==SPIRV::Type::BackingType::Boolean){op=opcode==LLVMAnd?167:(opcode==LLVMOr?166:165);}
++                    if(isBooleanLLVMType(DynamicLLVM::LLVMTypeOf(inst))){
++                        // modulo 2, add and sub are xor and mul is and; the others have no boolean form
++                        switch(opcode){case LLVMAnd:case LLVMMul:op=SPIRVOp::LogicalAnd;break;case LLVMOr:op=SPIRVOp::LogicalOr;break;
++                          case LLVMXor:case LLVMAdd:case LLVMSub:op=SPIRVOp::LogicalNotEqual;break;
++                          default:throw std::runtime_error("Unsupported AIR boolean arithmetic: "+describeLLVMValue(inst));}
++                    }
 +                    auto result=builder.encodeRawOp(op,type,{lhs,rhs});builder.associateExistingResultID(result,reinterpret_cast<uintptr_t>(inst));
 +                } break;
  				case LLVMFMul:
  				case LLVMFDiv:
  				case LLVMFAdd:
-@@ -1365,28 +2112,81 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
+@@ -1365,28 +2197,90 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
  					auto op1 = DynamicLLVM::LLVMGetOperand(inst, 0);
  					auto op2 = DynamicLLVM::LLVMGetOperand(inst, 1);
  					auto predicate = DynamicLLVM::LLVMGetFCmpPredicate(inst);
@@ -7741,14 +7933,14 @@ index 21c501f..9f2990b 100644
 +					}
 +
 +					auto resID = builder.encodeRawOp(spirvOpcode, type, { llvmValueToResultID(builder, op1), llvmValueToResultID(builder, op2) });
++
++					builder.associateExistingResultID(resID, reinterpret_cast<uintptr_t>(inst));
++					builder.setResultType(resID, type);
++				} break;
  
 -						case LLVMRealOLT: {
 -							resID = builder.encodeFOrdLessThan(llvmValueToResultID(builder, op1), llvmValueToResultID(builder, op2));
 -						} break;
-+					builder.associateExistingResultID(resID, reinterpret_cast<uintptr_t>(inst));
-+					builder.setResultType(resID, type);
-+				} break;
-+
 +				case LLVMICmp: {
 +					auto op1 = DynamicLLVM::LLVMGetOperand(inst, 0);
 +					auto op2 = DynamicLLVM::LLVMGetOperand(inst, 1);
@@ -7771,9 +7963,18 @@ index 21c501f..9f2990b 100644
 -							throw std::runtime_error("TODO: handle fcmp predicate: " + std::to_string(predicate));
 +							throw std::runtime_error("TODO: handle icmp predicate: " + std::to_string(predicate));
  					}
- 
-+					auto resID = builder.encodeRawOp(spirvOpcode, type, { llvmValueToResultID(builder, op1), llvmValueToResultID(builder, op2) });
++					if (isBooleanLLVMType(DynamicLLVM::LLVMTypeOf(op1))) {
++						// OpIEqual and the ordered integer comparisons require integer operands
++						switch (predicate) {
++							case LLVMIntEQ: spirvOpcode = SPIRVOp::LogicalEqual; break;
++							case LLVMIntNE: spirvOpcode = SPIRVOp::LogicalNotEqual; break;
++							default:
++								throw std::runtime_error("Unsupported AIR boolean comparison: " + describeLLVMValue(inst));
++						}
++					}
 +
++					auto resID = builder.encodeRawOp(spirvOpcode, type, { llvmValueToResultID(builder, op1), llvmValueToResultID(builder, op2) });
+ 
  					builder.associateExistingResultID(resID, reinterpret_cast<uintptr_t>(inst));
  					builder.setResultType(resID, type);
  				} break;
@@ -7801,7 +8002,7 @@ index 21c501f..9f2990b 100644
  					if (DynamicLLVM::LLVMIsConditional(inst)) {
  						auto condition = DynamicLLVM::LLVMGetCondition(inst);
  						auto trueLabel = DynamicLLVM::LLVMBasicBlockAsValue(DynamicLLVM::LLVMGetSuccessor(inst, 0));
-@@ -1422,25 +2222,38 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
+@@ -1422,25 +2316,38 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
  					auto type = llvmTypeToSPIRVType(builder, lltype);
  
  					std::vector<std::pair<SPIRV::ResultID, SPIRV::ResultID>> variablesAndBlocks;
@@ -7843,7 +8044,7 @@ index 21c501f..9f2990b 100644
  
  					// ensure the resulting pointer storage class is the same as the input pointer storage class
  					auto typeInst = *builder.reverseLookupType(type);
-@@ -1474,6 +2287,7 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
+@@ -1474,6 +2381,7 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
  		}
  	}
  
@@ -9943,7 +10144,7 @@ new file mode 100644
 +	}
 +}
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 8d95863..1af3167 100644
+index 8d95863..b24f2b4 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -2,6 +2,41 @@ project(indium)
@@ -9988,7 +10189,7 @@ index 8d95863..1af3167 100644
  find_package(LLVM REQUIRED CONFIG)
  
  if (DARLING)
-@@ -158,11 +193,35 @@ if (NOT DARLING)
+@@ -158,16 +193,64 @@ if (NOT DARLING)
  	)
  endif()
  
@@ -10029,8 +10230,37 @@ index 8d95863..1af3167 100644
  
  target_compile_definitions(iridium PRIVATE
  	"HOST_LLVM_LIBNAME=\"${HOST_LLVM_LIBNAME}\""
+ )
+ 
++# Indium keeps translated shaders on disk under Iridium::translatorIdentity(), which starts with this hash of every
++# Iridium source and header: translations made by a different translator are never reused. Configure again whenever
++# one of these files changes, so that the hash cannot fall behind the sources.
++file(GLOB_RECURSE iridium_identity_files LIST_DIRECTORIES false RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}"
++	"${CMAKE_CURRENT_SOURCE_DIR}/include/iridium/*"
++	"${CMAKE_CURRENT_SOURCE_DIR}/private-include/iridium/*"
++	"${CMAKE_CURRENT_SOURCE_DIR}/src/iridium/*"
++)
++list(SORT iridium_identity_files)
++set(iridium_identity_input "")
++foreach(iridium_identity_file IN LISTS iridium_identity_files)
++	file(SHA256 "${CMAKE_CURRENT_SOURCE_DIR}/${iridium_identity_file}" iridium_identity_file_hash)
++	string(APPEND iridium_identity_input "${iridium_identity_file}:${iridium_identity_file_hash}\n")
++	set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${iridium_identity_file}")
++endforeach()
++if (NOT iridium_identity_input)
++	message(FATAL_ERROR "No Iridium sources found to hash under ${CMAKE_CURRENT_SOURCE_DIR}")
++endif()
++string(SHA256 IRIDIUM_SOURCE_HASH "${iridium_identity_input}")
++
++target_compile_definitions(iridium PRIVATE
++	"IRIDIUM_SOURCE_HASH=\"${IRIDIUM_SOURCE_HASH}\""
++)
++
+ if (DARLING)
+ 	target_link_libraries(iridium PRIVATE
+ 		cxx
 diff --git a/src/iridium/dynamic-llvm.cpp b/src/iridium/dynamic-llvm.cpp
-index 1b5876e..03af560 100644
+index 1b5876e..7e2a422 100644
 --- a/src/iridium/dynamic-llvm.cpp
 +++ b/src/iridium/dynamic-llvm.cpp
 @@ -1,4 +1,7 @@
@@ -10041,7 +10271,15 @@ index 1b5876e..03af560 100644
  
  #ifdef DARLING
  	#include <elfcalls.h>
-@@ -19,7 +22,20 @@ bool Iridium::DynamicLLVM::init() {
+@@ -6,6 +9,7 @@
+ #endif
+ 
+ static void* libraryHandle = NULL;
++static std::string loadedVersionString;
+ 
+ #define DYNAMICLLVM_FUNCTION_DEF(_name) \
+ 	Iridium::DynamicLLVM::DynamicFunction<decltype(_name)> Iridium::DynamicLLVM::_name(#_name);
+@@ -19,10 +23,29 @@ bool Iridium::DynamicLLVM::init() {
  	libraryHandle = dlopen(HOST_LLVM_LIBNAME, RTLD_LAZY);
  #endif
  
@@ -10059,10 +10297,19 @@ index 1b5876e..03af560 100644
 +			std::to_string(LLVM_VERSION_MAJOR) + ", loaded LLVM " + std::to_string(major) +
 +			" from " HOST_LLVM_LIBNAME "; rebuild and reinstall the runtime with matching LLVM headers and library");
 +	}
++	loadedVersionString = std::to_string(major) + "." + std::to_string(minor) + "." + std::to_string(patch);
 +	return true;
++};
++
++const std::string& Iridium::DynamicLLVM::loadedVersion() {
++	return loadedVersionString;
  };
  
  void Iridium::DynamicLLVM::finit() {
++	loadedVersionString.clear();
+ 	if (libraryHandle) {
+ #ifdef DARLING
+ 		_elfcalls->dlclose(libraryHandle);
 diff --git a/private-include/indium/completion-spin.private.hpp b/private-include/indium/completion-spin.private.hpp
 new file mode 100644
 index 0000000..962fdad
@@ -10088,10 +10335,19 @@ index 0000000..962fdad
 +}
 +}
 diff --git a/private-include/indium/render-pipeline.private.hpp b/private-include/indium/render-pipeline.private.hpp
-index 7e5f242..7a4ad51 100644
+index 7e5f242..736f816 100644
 --- a/private-include/indium/render-pipeline.private.hpp
 +++ b/private-include/indium/render-pipeline.private.hpp
-@@ -22,6 +22,9 @@ namespace Indium {
+@@ -6,6 +6,8 @@
+ #include <vulkan/vulkan.h>
+ 
+ #include <array>
++#include <atomic>
++#include <mutex>
+ #include <optional>
+ 
+ namespace Indium {
+@@ -22,6 +24,9 @@ namespace Indium {
  			std::optional<VertexDescriptor> _vertexDescriptor;
  
  		public:
@@ -10101,11 +10357,14 @@ index 7e5f242..7a4ad51 100644
  			PrivateRenderPipelineState(std::shared_ptr<PrivateDevice> device, const RenderPipelineDescriptor& descriptor);
  			~PrivateRenderPipelineState();
  
-@@ -37,9 +40,17 @@ namespace Indium {
+@@ -37,19 +42,32 @@ namespace Indium {
  			//       if so, we would always be able to create the pipeline immediately
  			//       in the constructor.
  			void recreatePipeline(VkRenderPass compatibleRenderPass, bool force);
-+			VkPipeline pipelineForTopologyIndex(size_t index);
++			// Point and line pipelines are built on their first draw, against the render pass of the encoder
++			// that draws: a render pass may be destroyed with its encoder, so none is kept here. Any render
++			// pass this state is used with is assumed compatible with the first one, as in recreatePipeline.
++			VkPipeline pipelineForTopologyIndex(size_t index, VkRenderPass compatibleRenderPass);
 +
 +            bool ready() const {
 +                return _pipelineLayout && (_pipelines[0] || _pipelines[1] || _pipelines[2]);
@@ -10119,12 +10378,19 @@ index 7e5f242..7a4ad51 100644
  
  			INDIUM_PROPERTY_READONLY_OBJECT(PrivateDevice, p, P,rivateDevice);
  
-@@ -51,5 +62,7 @@ namespace Indium {
+-			// one for each topology class
+-			using PipelineArray = std::array<VkPipeline, 3>;
+-			INDIUM_PROPERTY(PipelineArray, p, P,ipelines) {};
+ 			INDIUM_PROPERTY(VkPipelineLayout, p, P,ipelineLayout) = VK_NULL_HANDLE;
+ 
  			INDIUM_PROPERTY_REF(DescriptorSetLayouts<2>, d, D,escriptorSetLayouts);
  
  			INDIUM_PROPERTY_READONLY_REF(std::vector<size_t>, v,V,ertexInputBindings);
 +		private:
-+			VkRenderPass _compatibleRenderPass = VK_NULL_HANDLE;
++			// One for each topology class. Encoders on different threads may draw a new topology class with
++			// the same state: slots are atomic so the unlocked lookup and ready() can read while one is built.
++			std::array<std::atomic<VkPipeline>, 3> _pipelines {};
++			std::mutex _lazyPipelineMutex;
  	};
  };
 diff --git a/private-include/indium/vertex-input.private.hpp b/private-include/indium/vertex-input.private.hpp
@@ -10381,3 +10647,34 @@ index 759a4df..3ee4321 100644
 +		std::vector<std::pair<Size, VkPipeline>> _cachedPipelines;
  	};
  };
+diff --git a/src/iridium/iridium.cpp b/src/iridium/iridium.cpp
+index 6e2db34..cf2a98f 100644
+--- a/src/iridium/iridium.cpp
++++ b/src/iridium/iridium.cpp
+@@ -7,6 +7,13 @@
+ 
+ #include <cstdlib>
+ 
++// The build supplies a hash of every Iridium source and header (see CMakeLists.txt). There is no default:
++// a constant here would let translations cached by an older translator be reused after a fix.
++#ifndef IRIDIUM_SOURCE_HASH
++	#error "IRIDIUM_SOURCE_HASH is not defined: compile Iridium with -DIRIDIUM_SOURCE_HASH=\"<hash of its sources>\""
++#endif
++static_assert(sizeof(IRIDIUM_SOURCE_HASH) > 16, "IRIDIUM_SOURCE_HASH must be a hash of the Iridium sources");
++
+ bool Iridium::init() {
+ 	return Iridium::DynamicLLVM::init();
+ };
+@@ -15,6 +22,12 @@ void Iridium::finit() {
+ 	Iridium::DynamicLLVM::finit();
+ };
+ 
++std::string Iridium::translatorIdentity() {
++	const auto& llvmVersion = Iridium::DynamicLLVM::loadedVersion();
++	if (llvmVersion.empty()) return {};
++	return std::string(IRIDIUM_SOURCE_HASH) + "-llvm" + llvmVersion;
++};
++
+ void* Iridium::translate(const void* inputData, size_t inputSize, size_t& outputSize, OutputInfo& outputInfo) {
+ 	AIR::Library lib(inputData, inputSize);
+ 	SPIRV::Builder builder;
