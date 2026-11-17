@@ -108,6 +108,21 @@ The menu/desktop shortcut runs `scripts/launch-shortcut.sh` (or `toolbox run -c 
 
 - `Riot Client is not installed in ...; launching scripts/installer.sh <region>` followed by installer output means the auto-install started; it can take several minutes without any on-screen progress.
 - Without `notify-send` (or a session DBus) the notification is skipped silently; the log is the only feedback channel.
+- The installer is retried when it fails to install the client. Its native UI
+  has crashed mid-install under Darling (`LOLSIGFAIL`, `sig=11`, right after
+  `CGLCreateContext`), leaving a partial `Riot Client.app` (no
+  `Contents/MacOS`) and a partial `Metadata/Riot Client` database.
+  `installer.sh` removes that partial state and reruns the installer up to
+  three times in total; a complete installation is never removed. Desktop
+  notifications report each retry, the final failure, and the install success
+  before the client starts.
+- Ctrl-C (or a `SIGTERM` to `installer.sh`) stops the installer without a
+  retry and without removing what the interrupted attempt wrote; the next run
+  cleans it up.
+- `A Riot Client install is already running (pid N)` means a second launch
+  reached the installer while the first one was still working; it exits
+  without touching anything. The lock is `build/installer.lock`, and one left
+  by a killed installer is detected as stale and replaced on the next run.
 
 ## Memory installer: permission denied
 
@@ -307,7 +322,7 @@ driver update recompiles once and caches again.
 
 Use `sh scripts/installer.sh euw` (or your supported region). The first-time launcher must omit the installed client's `--app-root` and pass `--skip-to-install`; the normal wrapper now does this. It also selects `league_of_legends` so the product installation UI appears after login.
 
-The installer window closing on its own, followed by `subprocess exit`, is usually a successful install: Riot's installer puts the client in `/Users/Shared/Riot Games/Riot Client.app` and exits, and its LaunchServices hand-off to that client does not start it under Darling. `scripts/installer.sh` now launches the installed client itself, and the runner links it to `/Applications/Riot Client.app` when that link is missing. If the client was not installed, the wrapper prints the installer's log directory; check the end of the newest `Launcher` log there.
+The installer window closing on its own, followed by `subprocess exit`, is usually a successful install: Riot's installer puts the client in `/Users/Shared/Riot Games/Riot Client.app` and exits, and its LaunchServices hand-off to that client does not start it under Darling. `scripts/installer.sh` now launches the installed client itself, and the runner links it to `/Applications/Riot Client.app` when that link is missing. If the client was not installed, the wrapper prints the installer's log directory; check the end of the newest `Launcher` log there. A bundle without `Contents/MacOS` is a partial install left by a crashed attempt, not an installed client: the shortcut and the runner only treat the installation as present when that directory exists, and `installer.sh` removes the partial bundle before retrying.
 
 If logs report guest `/private/tmp` permission errors, the default prefix needs its own temporary directory. The corrected full runtime installer creates it. To repair just this default-prefix directory as your ordinary user:
 
@@ -319,6 +334,25 @@ chmod 1777 "$HOME/.darling/private/tmp"
 The installer fetcher no longer treats a missing archive `Info.plist` or the informational `unzip | head` listing as a fatal download failure. Download and extraction errors still fail. The wrapper invokes this fetcher with Bash, since its `pipefail` setting is unsupported by some `/bin/sh` implementations.
 
 There is also a separate known compatibility gap: native LaunchAgent watch registration can return HTTP 409 after the League install path is accepted, leaving the download idle. A historical inspector hook handles this and interrupted `pending_verify` states in 28 mock cases, but that hook is disabled in normal launches and excluded from the manual workflow. There is no verified runtime-only replacement for that handoff in this snapshot. Do not assume the native permission and launcher fixes resolve every idle Install case, or enable debugger/API automation to work around it.
+
+### Fresh install of the Riot software
+
+To remove every trace of the Riot Client (and by default the game) from the
+prefix so `scripts/installer.sh <region>` can reinstall from scratch, run:
+
+```sh
+sh scripts/uninstall.sh
+```
+
+Close the game and both clients first: the script refuses to run while a Riot
+Client or League process is running. It lists what it will remove and keep and
+asks for confirmation (`--yes` skips the question, and is required when there
+is no terminal), then stops the runtime, saves the Riot logs under
+`build/uninstall-log-backups/`, removes the client, its metadata and settings,
+and keeps the Darling runtime (overlays, certificate store) and the Mesa shader
+cache. `--keep-game` keeps the game and its product metadata instead of
+removing it, and `--all` removes the whole prefix. Only a Darling prefix is
+accepted; any other directory is refused.
 
 ## Riot exits and League reports that it lost its connection
 
@@ -552,7 +586,16 @@ splash overlay. It is not managed by the window manager, does not appear in
 main client window and should not be presented. See the observed properties in
 [the splash window note](notes/league-splash-window-512x216.md).
 
-An opt-in helper polls the X11 tree every five seconds and unmaps only windows
+A splash that stays after startup usually means LeagueClient never received
+the UX's load report: its `LeagueClient.log` stops at
+`UX_PROCESS_BOOTSTRAP_COMPLETE 6/7` and has no `Ux reports successful load`,
+because LeagueClientUx dropped its link (close code 1003, "Unsupported Data
+Type") first. The launcher's session supervisor delivers that report over the
+client's local API (`PUT /riotclient/ux-load-complete`) after 3 seconds, and
+LeagueClient hides the splash itself. It is on by default;
+`RCLOL_FINISH_LEAGUE_LOAD=0` turns it off.
+
+If the splash still comes back, an opt-in helper polls the X11 tree every five seconds and unmaps only windows
 that match the class, the fixed `512x216` size and the override-redirect flag.
 
 Use the standalone wrapper from a terminal (Ctrl+C stops it):
@@ -1327,3 +1370,41 @@ systemctl --user restart omarchy-crash-watch.service
 as well as loader crashes. Remove the drop-in, then `daemon-reload` and restart
 the unit, to announce them again. Do not use `omarchy-toggle-crash-capture` for
 this: it disables crash notifications for the whole session.
+
+## Riot Client appears to ignore clicks or stops scrolling (#203)
+
+CoreVideo previously kept one display-link callback and running state for the
+entire process. Chromium 150 creates separate display links on its GPU and Viz
+threads, even for one monitor. The second registration replaced the first, so
+rendering ticks continued while presentation callbacks stopped. Chromium then
+reached its two-pending-swap limit and stopped updating the window. Input could
+still reach the page while the displayed controls stayed unchanged.
+
+Display links now keep independent callback, retain and running state. Native
+regression checks cover two links to the same display, independent stop/release,
+slot reuse and callback-side stop. The offline Electron 43 terms fixture
+previously stopped scrolling before Accept enabled; it reaches the bottom and
+accepts with the corrected CoreVideo, with hardware acceleration enabled and
+without disabling frame-rate limiting. In the actual signed-out Riot Client 143,
+the previously frozen language list now scrolls to the end and the dialog closes
+visibly with hardware acceleration enabled. This addresses the reproduced frame
+stall; the reporter's exact authenticated ToS case and normal window-close
+event still need confirmation.
+
+After the base build, compile CoreVideo and the native regression without
+installing them, from the configured runtime workspace:
+
+```sh
+cd build/runtime
+python3 tools/build-m58f341-corevideo.py
+```
+
+This produces `build/riot-display-link-isolation-check`. After selecting an
+idle test prefix with the corrected CoreVideo installed, run from the same
+workspace:
+
+```sh
+python3 tools/run-riot-native-check.py riot-display-link-isolation-check
+```
+
+The probe does not launch Riot or League.
