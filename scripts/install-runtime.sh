@@ -21,7 +21,11 @@ python3 build/runtime/tools/ensure-darling-runtime.py
 # Darling treats a missing prefix directory as new; only then is an identity generated below.
 new_prefix=
 [ -e "$prefix_dir" ] || new_prefix=1
-darling shell /usr/bin/true
+# A boot is only needed to create the prefix: an initialized prefix leaves its
+# system.prop behind as proof, so skip the full guest boot on re-installs.
+if [ -n "$new_prefix" ] || [ ! -e "$prefix_dir/private/etc/darling-system.prop" ]; then
+  darling shell /usr/bin/true
+fi
 # The prefix has no /private/tmp of its own, so the guest falls through to the root-owned
 # installed layer and every write there (the Riot installer's temp files) fails with EACCES.
 prefix=$prefix_dir
@@ -29,11 +33,14 @@ mkdir -p "$prefix/private/tmp"
 chmod 1777 "$prefix/private/tmp"
 # The single hardware-presentation profile lives in the prefix so it survives
 # updates and can be edited without touching the checkout. Never replace an
-# existing profile: an update must not turn a user's HOST/COMPAT choice back on.
+# existing profile: an update must not undo a user's HOST/COMPAT choice.
 if [ ! -e "$prefix/private/etc/darling-system.prop" ]; then
   mkdir -p "$prefix/private/etc"
   install -m 0644 build/runtime/tools/system.prop "$prefix/private/etc/darling-system.prop"
 fi
+# One-time move of profiles installed while HOST was the default (issue #31).
+python3 build/runtime/tools/migrate-system-profile.py "$prefix/private/etc/darling-system.prop" || \
+  echo "Hardware profile not migrated; set profile=compat in $prefix/private/etc/darling-system.prop" >&2
 # Build the system root store now that the prefix exists; Darling is stopped next anyway.
 python3 build/runtime/tools/ensure-darling-root-certificates.py || \
   echo 'Darling system root store not installed; the launcher retries it' >&2
