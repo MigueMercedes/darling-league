@@ -21,10 +21,21 @@ darling-lol --perf                  # frame pacing from the game's own logs
 
 The crash bundle contains the doctor checks, the runtime/client/zombie process
 table, the runtime and launcher log tails, graphics kernel messages, display
-state and recent core dumps. It does not collect environment variables, masks
-credential-shaped command-line values, and replaces your home directory, user
-name and host name unless you pass `--no-redact`. Log text itself is copied
-verbatim, so skim the bundle before sharing it. See
+state and recent core dumps. It also includes the tails of the newest Riot
+Client, LeagueClient/LeagueClientUx and game (`r3dlog`) logs, and the Metal,
+signal, input-trace and game-switch logs from `/tmp` when they exist;
+`report.json` lists the client logs it looked for and did not find. Pass
+`--no-client-logs` to leave all of those out. It does not collect environment
+variables, masks credential-shaped command-line values, masks session tokens,
+account ids, game names and e-mail addresses in the client logs (even with
+`--no-redact`), and replaces your home directory, user name and host name
+unless you pass `--no-redact`. Other log text is copied verbatim, so skim the
+bundle before sharing it.
+
+The doctor also warns about diagnostic switches left on (for example
+`/tmp/rclol-input-trace`, `/tmp/metal-debug-waits` or `RCLOL_*_TRACE`
+variables), non-default tuning files, and hybrid graphics started without
+complete PRIME offload variables. See
 [compatibility](COMPATIBILITY.md) for what the performance numbers mean and
 for verified machines.
 
@@ -494,6 +505,16 @@ tree running. The supervisor:
   prefix or a host process is never touched.
 - shuts the runtime down after the loader exits normally. If a second launch
   attached to a runtime that was already running, that runtime is left alone.
+- stops the Toolbox container when the launcher was started by `toolbox run`
+  (a menu entry or `toolbox run -c <container> ...`). `toolbox run` leaves the
+  container running after its command exits, and `podman stop` is unavailable
+  inside the container, so the supervisor stops the container's host systemd
+  user scope after the guest session is gone. If multiple Darling-LoL sessions
+  share the container, the runtime owner can pass the shutdown request to the
+  last eligible session. The supervisor leaves the container running when an
+  interactive `toolbox enter` shell or other work remains in that scope, or
+  when it cannot verify the scope. Set `RCLOL_STOP_TOOLBOX=0` on a launch to
+  keep the container running when that session finishes last.
 - leaves everything as it was with `RCLOL_CLEAN_ON_EXIT=0`, which is the old
   `exec` behaviour.
 
@@ -910,6 +931,8 @@ rm -rf build/darling-src/build
 ./scripts/build.sh
 ```
 
+A checkout reached through a symlink (for example `~/dev` pointing at `~/Development`) is not a move: `scripts/build.sh` configures CMake with the checkout's physical path however it was started. It used the path it was reached through, and CMake writes that into every target's flags, so building once through the symlink and once without recompiled everything. The first build after this change does that one last time if the existing cache holds the symlinked path.
+
 Patches are rendered at `scripts/prepare.py` time, so `@PROJECT_ROOT@` in a patched file keeps the old path until it runs again. `./scripts/build.sh` and `./scripts/update.sh` both do that; do not run `prepare.py` by hand while the checkout has other edits in `build/darling-src`, because it refuses rather than resetting them.
 
 The opt-in RenderDoc capture bridge (`RCLOL_RENDERDOC_CAPTURE=1`) is a developer diagnostic, not part of the installer. It expects `build/renderdoc/capture-bridge.so` and a RenderDoc build under `build/renderdoc/`, and neither setup script creates them. Without those files the capture is skipped and the game runs normally; the absolute path baked into the Indium patch is refreshed by the same `prepare.py` run.
@@ -980,7 +1003,7 @@ With the window visual and compositor draw buffer fixes (#22) and the RPC socket
 
 If the game window stays black on NVIDIA, check `metal-device.log` as described in [Check which GPU rendered](#check-which-gpu-rendered).
 
-If a match ends with `NVRM: Xid … 31 … MMU Fault` and 5 s frames ([#252](https://github.com/lucannez64/darling-lol/issues/252)), run one match with `INDIUM_POISON_FREED_MAPPINGS=1 ./scripts/run.sh` (or `darling shell touch /tmp/metal-poison-freed-mappings` before launching; works on AMD too): every resource gets its own allocation, a CPU write to freed Indium memory then crashes at that address instead of passing silently, and the guest `/tmp/indium-poison.log` lists each freed mapping with the code that created it, recycled handles, and semaphore destroys deferred because a signal was still pending. It is slower; do not keep it on.
+If a match ends with `NVRM: Xid … 31 … MMU Fault` and 5 s frames ([#252](https://github.com/lucannez64/darling-lol/issues/252)), run one match with `INDIUM_POISON_FREED_MAPPINGS=1 ./scripts/run.sh` (or `darling shell touch /tmp/metal-poison-freed-mappings` before launching; works on AMD too): every resource gets its own allocation, a CPU write to freed Indium memory then crashes at that address instead of passing silently while the address stays reserved, and the guest `/tmp/indium-poison.log` lists each freed mapping with the code that created it, recycled handles, and semaphore destroys deferred because a signal was still pending. The crash is not guaranteed: a freed mapping logged `NOT-reserved` (the reservation failed) is not protected, and only the newest 16384 reservations are kept, so a match without a crash does not rule out a lifetime bug; check the log for `reserved-no-access` versus `NOT-reserved`. It is slower; do not keep it on.
 
 On an RTX 3060 with driver 615.78.08, a practice game rejected a Metal
 constant vertex layout (`stepFunction=Constant`, `stepRate=0`). Indium now

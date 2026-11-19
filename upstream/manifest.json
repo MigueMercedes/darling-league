@@ -133,7 +133,7 @@
       "revision": "89751e64bc6c2082f7725061824ee0e33395b0de",
       "repository": "https://github.com/darlinghq/darlingserver.git",
       "patch": "patches/darlingserver.patch",
-      "modified_files": 37,
+      "modified_files": 38,
       "new_files": [
         "duct-tape/src/fileport.c",
         "include/darlingserver/cs_state.h",
@@ -184,7 +184,10 @@
         "src/PowerSources.mm",
         "src/HostPowerInhibit.c",
         "src/HostPowerInhibit.h",
-        "src/PlatformIdentity.h"
+        "src/PlatformIdentity.h",
+        "src/IOGraphicsAccelerator.h",
+        "src/IOGraphicsAccelerator.mm",
+        "src/IOGraphicsAcceleratorIds.h"
       ]
     },
     {
@@ -200,7 +203,7 @@
       "revision": "380f03c180b80d940134fb35783ddc714784a53a",
       "repository": "https://github.com/darlinghq/darling-libdispatch.git",
       "patch": "patches/libdispatch.patch",
-      "modified_files": 1,
+      "modified_files": 2,
       "new_files": []
     },
     {
@@ -311,9 +314,13 @@
       "revision": "3cfffcf2c5b5900169c964facdf42cc05c23005c",
       "repository": "https://github.com/darlinghq/darling-security.git",
       "patch": "patches/security.patch",
-      "modified_files": 16,
+      "modified_files": 19,
       "new_files": [
-        "OSX/libsecurity_codesigning/lib/rclol_signing_trace.h"
+        "OSX/libsecurity_codesigning/lib/rclol_signing_trace.h",
+        "OSX/sec/Security/DarlingKeychain.h",
+        "OSX/sec/Security/DarlingKeychain.m",
+        "OSX/sec/Security/DarlingP256.c",
+        "OSX/sec/Security/DarlingP256.h"
       ]
     },
     {
